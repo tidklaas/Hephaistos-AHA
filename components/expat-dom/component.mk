@@ -1,0 +1,5 @@
+COMPONENT_PRIV_INCLUDEDIRS := include/
+COMPONENT_ADD_INCLUDEDIRS := src
+COMPONENT_DEPENDS := expat
+COMPONENT_SRCDIRS := src
+COMPONENT_OBJS := src/escape.o src/expat-dom.o

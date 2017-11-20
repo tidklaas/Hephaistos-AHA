@@ -1,0 +1,60 @@
+menu "Hephaistos Configuration"
+
+config WIFI_SSID
+    string "WiFi SSID"
+	default "myssid"
+	help
+		SSID (network name) to connect to.
+
+config WIFI_PASSWORD
+    string "WiFi Password"
+	default "myssid"
+	help
+		WiFi password (WPA or WPA2) to use.
+
+		Can be left blank if the network has no security set.
+
+config FBOX_USER
+    string "F!Box User"
+	default "admin"
+	help
+		F!Box user for login.
+
+config FBOX_PASSWORD
+    string "F!Box Password"
+	default "secret"
+	help
+		Password for logging in to F!Box.
+
+config FBOX_ADDR
+    string "F!Box Address"
+    default "192.168.178.1"
+	help
+		IP address of F!Box.
+
+config FBOX_PORT
+    string "F!Box Port"
+	default "80"
+	help
+		Port to connect to on F!Box.
+
+config CTRL_GPIO 
+    int "GPIO Pin"
+	default 18
+	help
+		GPIO pin used for controlling heater. 
+
+config TIMEZONE
+    string "Time Zone"
+	default "CET+1CEST,M3.5.0/2,M10.5.0"
+	help
+		Local time zone. Defaults to Europe/Berlin.
+
+config HYSTERESIS
+    int "Hysteresis time"
+	default 300
+	help
+		Hysteresis time in seconds.
+
+
+endmenu

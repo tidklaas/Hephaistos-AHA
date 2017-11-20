@@ -1,0 +1,3 @@
+[submodule "components/expat-dom/src"]
+	path = components/expat-dom/src
+	url = https://github.com/kolotsey/expat-dom.git
