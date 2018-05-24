@@ -38,17 +38,24 @@ config FBOX_PORT
 	help
 		Port to connect to on F!Box.
 
-config CTRL_GPIO 
-    int "GPIO Pin"
+config GPIO_HEAT
+    int "Heater Control Pin"
 	default 18
 	help
 		GPIO pin used for controlling heater. 
+
+config GPIO_LED
+    int "LED Control Pin"
+	default 19
+	help
+		GPIO pin used for controlling update indication LED.
 
 config TIMEZONE
     string "Time Zone"
 	default "CET+1CEST,M3.5.0/2,M10.5.0"
 	help
 		Local time zone. Defaults to Europe/Berlin.
+
 
 config HYSTERESIS
     int "Hysteresis time"

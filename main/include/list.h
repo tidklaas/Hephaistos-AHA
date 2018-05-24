@@ -127,10 +127,25 @@ static inline void __list_del(struct aha_list_head *prev, struct aha_list_head *
  * Note: list_empty() on entry does not return true after this, the entry is
  * in an undefined state.
  */
+static inline void __list_del_entry(struct aha_list_head *entry)
+{
+    __list_del(entry->prev, entry->next);
+}
+
 static inline void aha_list_del(struct aha_list_head *entry)
 {
 	__list_del(entry->prev, entry->next);
 	entry->next = (struct aha_list_head*)LIST_POISON1;
 	entry->prev = (struct aha_list_head*)LIST_POISON2;
+}
+
+/**
+ * list_del_init - deletes entry from list and reinitialize it.
+ * @entry: the element to delete from the list.
+ */
+static inline void aha_list_del_init(struct aha_list_head *entry)
+{
+    __list_del_entry(entry);
+    AHA_INIT_LIST_HEAD(entry);
 }
 #endif

@@ -31,6 +31,7 @@
 #include "esp_event_loop.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 
@@ -68,15 +69,19 @@
 #define FBOX_ADDR       CONFIG_FBOX_ADDR
 #define FBOX_PORT       CONFIG_FBOX_PORT
 #define TIMEZONE        CONFIG_TIMEZONE
-#define GPIO_OUTPUT_IO  CONFIG_CTRL_GPIO
+#define GPIO_HEAT       CONFIG_GPIO_HEAT
+#define GPIO_LED        CONFIG_GPIO_LED
+
+#define TWDT_TIMEOUT_S          300
+#define TASK_RESET_PERIOD_S     5
 
 #if defined(ESP_PLATFORM)
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
 static EventGroupHandle_t wifi_event_group;
 
 /* The event group allows multiple bits for each event,
- but we only care about one event - are we connected
- to the AP with an IP? */
+ * but we only care about one event - are we connected
+ * to the AP with an IP? */
 const int CONNECTED_BIT = BIT0;
 #else
 #define ESP_LOGE(tag, format, ... )  printf("[%s]" format "\n", tag, ##__VA_ARGS__)
@@ -86,6 +91,7 @@ const int CONNECTED_BIT = BIT0;
 #endif // defined(ESP_PLATFORM)
 
 #define ARRAY_SIZE(x)   (sizeof(x) / sizeof(*(x)))
+static void debug_led(unsigned int led, int on_off);
 
 static const char *TAG = "hephaistos";
 
@@ -114,9 +120,8 @@ struct aha_state
     SemaphoreHandle_t sema;
     TimerHandle_t hyst_timer;
 #endif
-    struct aha_list_head dev_head; // list of all primary devices, i.e. groups and devices not belonging to a group
+    struct aha_list_head dev_head; // list of all devices
     struct aha_list_head grp_head; // list of all groups
-    enum aha_heat_mode heater;
 };
 
 static struct aha_state state;
@@ -529,7 +534,7 @@ err_out:
     return result;
 }
 
-static int parse_attr_long(dom_t *dom, const char *name, long *dst)
+static int __attribute__((unused)) parse_attr_long(dom_t *dom, const char *name, long *dst)
 {
     int result;
     const char *val;
@@ -1105,22 +1110,25 @@ err_out:
 
 static void free_devices(void)
 {
-    struct aha_device *device, *member, *tmp_dev, *tmp_mem;
+    struct aha_device *device, *group, *tmp_dev, *tmp_grp;
+
+    aha_list_for_each_entry_safe(group, tmp_grp, &(state.grp_head), grp_list)
+    {
+        /* remove all devices from the group's member list */
+        aha_list_for_each_entry_safe(device, tmp_dev, &(group->member_list), member_list)
+        {
+            aha_list_del(&(device->member_list));
+            device->group = NULL;
+        }
+
+        /* remove group from group list */
+        aha_list_del_init(&(group->grp_list));
+
+        free(group);
+    }
 
     aha_list_for_each_entry_safe(device, tmp_dev, &(state.dev_head), dev_list)
     {
-        if(device->type == aha_type_group){
-            /* free all devices in the group's member list */
-            aha_list_for_each_entry_safe(member, tmp_mem, &(device->member_list), member_list)
-            {
-                aha_list_del(&(member->member_list));
-                free(member);
-            }
-
-            /* remove device from group list */
-            aha_list_del(&(device->grp_list));
-        }
-
         /* remove device from device list */
         aha_list_del(&(device->dev_list));
         free(device);
@@ -1147,7 +1155,6 @@ static int parse_dom(dom_t *dom)
     while(entry != NULL){
         device = parse_entry(entry);
         if(device != NULL){
-            aha_list_add_tail(&(device->dev_list), &(state.dev_head));
             aha_list_add_tail(&(device->grp_list), &(state.grp_head));
         }
         entry = dom_find_node(entry->next, "group");
@@ -1157,13 +1164,15 @@ static int parse_dom(dom_t *dom)
     while(entry != NULL){
         device = parse_entry(entry);
         if(device != NULL){
+            aha_list_add_tail(&(device->dev_list), &(state.dev_head));
+
             aha_list_for_each_entry(group, &(state.grp_head), grp_list)
             {
                 for(idx = 0;idx < group->grp.member_cnt;++idx){
                     if(device->id == group->grp.members[idx]){
                         device->group = group;
                         aha_list_add_tail(&(device->member_list),
-                                &(group->member_list));
+                                          &(group->member_list));
                         break;
                     }
                 }
@@ -1172,11 +1181,8 @@ static int parse_dom(dom_t *dom)
                     break;
                 }
             }
-
-            if(device->group == NULL){
-                aha_list_add_tail(&(device->dev_list), &(state.dev_head));
-            }
         }
+
         entry = dom_find_node(entry->next, "device");
     }
 
@@ -1238,8 +1244,6 @@ static void dump_pwr(struct aha_power *pwr, const char *prefix)
 
 static void dump_device(struct aha_device *dev, const char *prefix)
 {
-    struct aha_device *member;
-
     ESP_LOGI(TAG, "%s[%s] Name: %s ID: %lu Present: %lu Ident: %s FW: %s "
                   "Manuf: %s ProdName: %s Funcs: 0x%lx",
              prefix,
@@ -1258,19 +1262,25 @@ static void dump_device(struct aha_device *dev, const char *prefix)
     dump_temp(&(dev->temp), prefix);
     dump_pwr(&(dev->pwr), prefix);
 
-    if(dev->type == aha_type_group && !aha_list_empty(&(dev->member_list))){
-        aha_list_for_each_entry(member, &(dev->member_list), member_list){
-            dump_device(member, " -> ");
-        }
-    }
 }
 
 static void dump_state(void)
 {
-    struct aha_device *dev;
+    struct aha_device *dev, *grp;
 
+    /* dump groups and its member devices */
+    aha_list_for_each_entry(grp, &(state.grp_head), grp_list){
+        dump_device(grp, "");
+        aha_list_for_each_entry(dev, &(grp->member_list), member_list){
+            dump_device(dev, " -> ");
+        }
+    }
+
+    /* dump remaining devices not belonging to a group */
     aha_list_for_each_entry(dev, &(state.dev_head), dev_list){
-        dump_device(dev, "");
+        if(dev->group == NULL){
+            dump_device(dev, "");
+        }
     }
 }
 
@@ -1499,7 +1509,7 @@ err_out:
 
 static enum aha_heat_mode need_heat(void)
 {
-    struct aha_device *device, *member;
+    struct aha_device *device;
     enum aha_heat_mode result, tmp;
 
     result = aha_heat_off;
@@ -1508,16 +1518,6 @@ static enum aha_heat_mode need_heat(void)
         if(tmp >= aha_heat_on){
             ESP_LOGI(TAG,"%s", device->name);
             result = tmp;
-        }
-
-        if(device->type == aha_type_group){
-            aha_list_for_each_entry(member, &(device->member_list), member_list){
-                tmp = dev_need_heat(member);
-                if(tmp >= aha_heat_on){
-                    ESP_LOGI(TAG,"%s", member->name);
-                    result = tmp;
-                }
-            }
         }
     }
 
@@ -1528,7 +1528,7 @@ static void fire(int on_off)
 {
     ESP_LOGI(TAG, "Fire %s!", on_off == 0 ? "off" : "on");
 #if defined(ESP_PLATFORM)
-    gpio_set_level(GPIO_OUTPUT_IO, on_off == 0 ? 0 : 1);
+    gpio_set_level(GPIO_HEAT, on_off == 0 ? 0 : 1);
 #endif
 }
 
@@ -1540,7 +1540,8 @@ static int gpio_setup(void)
 
     io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = (1 << GPIO_OUTPUT_IO);
+    io_conf.pin_bit_mask = (uint64_t)((1ULL << GPIO_HEAT)
+                                    | (1ULL << GPIO_LED));
     io_conf.pull_down_en = 0;
     io_conf.pull_up_en = 0;
     gpio_config(&io_conf);
@@ -1566,8 +1567,36 @@ static void hephaistos_task(void *pvParameters)
         goto err_out;
     }
 
+#if defined(ESP_PLATFORM)
+    result = esp_task_wdt_init(TWDT_TIMEOUT_S, true);
+    if(result != 0){
+        ESP_LOGE(TAG, "WDT setup failed.");
+        goto err_out;
+    }
+
+    result = esp_task_wdt_add(NULL);
+    if(result != 0){
+        ESP_LOGE(TAG, "WDT task add failed.");
+        goto err_out;
+    }
+
+    result = esp_task_wdt_status(NULL);
+    if(result != 0){
+        ESP_LOGE(TAG, "WDT status check failed.");
+        goto err_out;
+    }
+
+    result = esp_task_wdt_reset();
+    if(result != 0){
+        ESP_LOGE(TAG, "WDT reset failed.");
+        goto err_out;
+    }
+#endif
+
     do{
 #if defined(ESP_PLATFORM)
+        gpio_set_level(GPIO_LED, 1);
+
         /* Wait for the callback to set the CONNECTED_BIT in the
          * event group.       */
         xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
@@ -1605,6 +1634,16 @@ static void hephaistos_task(void *pvParameters)
             // do nothing
             break;
         }
+
+#if defined(ESP_PLATFORM)
+        gpio_set_level(GPIO_LED, 0);
+
+        result = esp_task_wdt_reset();
+        if(result != 0){
+            ESP_LOGE(TAG, "WDT reset failed.");
+            goto err_out;
+        }
+#endif
 
 wait_retry:
         sleep(10);
@@ -1678,7 +1717,7 @@ void app_main()
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     initialise_wifi();
-    get_time();
+    //get_time();
     initialise_state();
     xTaskCreate(&hephaistos_task, "hephaistos_task", 8192, NULL, 5, NULL);
 }
