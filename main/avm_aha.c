@@ -1,8 +1,20 @@
 /*
- * main.c
+ * This file is part of the Hephaistos-AHA project.
+ * Copyright (C) 2018  Tido Klaassen <tido_hephaistos@4gh.eu>
  *
- *  Created on: 04.11.2017
- *      Author: tido
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
 #include <string.h>
@@ -16,17 +28,16 @@
 #include <errno.h>
 #include <expat.h>
 #include <expat-dom.h>
-#include <list.h>
-#if !defined(ESP_PLATFORM)
-#include <bsd/bsd.h>
-#endif
-
+#include <klist.h>
+#include <kref.h>
+#include <hephaistos.h>
+#include <avm_aha.h>
 #include <sdkconfig.h>
 
-#if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
 #include "esp_wifi.h"
 #include "esp_event_loop.h"
 #include "esp_log.h"
@@ -41,14 +52,9 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 
-#include "apps/sntp/sntp.h"
-#endif // defined(ESP_PLATFORM)
-
 #include "mbedtls/platform.h"
 #include "mbedtls/net_sockets.h"
-#if defined(ESP_PLATFORM)
 #include "mbedtls/esp_debug.h"
-#endif // defined(ESP_PLATFORM)
 #include "mbedtls/ssl.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
@@ -56,48 +62,26 @@
 #include "mbedtls/certs.h"
 #include "mbedtls/md5.h"
 
-/* The examples use simple WiFi configuration that you can set via
- 'make menuconfig'.
-
- If you'd rather not, just change the below entries to strings with
- the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
- */
-#define WIFI_SSID       CONFIG_WIFI_SSID
-#define WIFI_PASS       CONFIG_WIFI_PASSWORD
-#define FBOX_USER       CONFIG_FBOX_USER
-#define FBOX_PASS       CONFIG_FBOX_PASSWORD
-#define FBOX_ADDR       CONFIG_FBOX_ADDR
-#define FBOX_PORT       CONFIG_FBOX_PORT
-#define TIMEZONE        CONFIG_TIMEZONE
 #define GPIO_HEAT       CONFIG_GPIO_HEAT
 #define GPIO_LED        CONFIG_GPIO_LED
 
 #define TWDT_TIMEOUT_S          300
 #define TASK_RESET_PERIOD_S     5
 
-#if defined(ESP_PLATFORM)
-/* FreeRTOS event group to signal when we are connected & ready to make a request */
-static EventGroupHandle_t wifi_event_group;
+static const char *TAG = "AHA";
 
-/* The event group allows multiple bits for each event,
- * but we only care about one event - are we connected
- * to the AP with an IP? */
-const int CONNECTED_BIT = BIT0;
-#else
-#define ESP_LOGE(tag, format, ... )  printf("[%s]" format "\n", tag, ##__VA_ARGS__)
-#define ESP_LOGI(tag, format, ... )  printf("[%s]" format "\n", tag, ##__VA_ARGS__)
-#define ESP_LOGW(tag, format, ... )  printf("[%s]" format "\n", tag, ##__VA_ARGS__)
-#define ESP_LOGD(tag, format, ... )  printf("[%s]" format "\n", tag, ##__VA_ARGS__)
-#endif // defined(ESP_PLATFORM)
+static struct aha_cfg aha_cfg;
+static SemaphoreHandle_t aha_cfg_lock = NULL;
 
-#define ARRAY_SIZE(x)   (sizeof(x) / sizeof(*(x)))
-static void debug_led(unsigned int led, int on_off);
-
-static const char *TAG = "hephaistos";
+static TimerHandle_t aha_timer = NULL;
+static EventGroupHandle_t aha_event_group;
+const int BIT_TIMER     = BIT0;
+const int BIT_SUSPEND   = BIT1;
+const int BIT_RELOAD    = BIT2;
 
 static const char *HTTP_REQ = 
         "GET %s HTTP/1.0\r\n"
-        "HOST: 192.168.178.1\r\n"
+        "HOST: %s\r\n"
         "CONNECTION: keep-alive\r\n"
         "USER-AGENT: AVM UPnP/1.0 Client 1.0\r\n"
         "\r\n";
@@ -108,214 +92,65 @@ static const char *HKR_REQ = "/webservices/homeautoswitch.lua?switchcmd=getdevic
 
 #define HTTP_REQ_SIZE   1024
 
-enum aha_heat_mode {
-    aha_heat_off = 0,
-    aha_heat_keep,
-    aha_heat_on
-};
+/* Pointer to current aha_data available through aha_data_get().
+ * Once initialised, will always hold a pointer to a valid data set */
+static struct aha_data *curr_aha_data = NULL;
+static SemaphoreHandle_t aha_data_lock = NULL;
 
-struct aha_state
+static struct aha_data *create_data(void)
 {
-#if defined(ESP_PLATFORM)
-    SemaphoreHandle_t sema;
-    TimerHandle_t hyst_timer;
-#endif
-    struct aha_list_head dev_head; // list of all devices
-    struct aha_list_head grp_head; // list of all groups
-};
+    struct aha_data *data;
 
-static struct aha_state state;
-
-#define MAX_ENTRY_LEN       128
-#define MAX_GROUP_MEMBERS   16
-
-#define HEAT_FORCE_ON   0xFE
-#define HEAT_FORCE_OFF  0xFD
-
-enum aha_entry_type
-{
-    aha_type_invalid = 0,
-    aha_type_device,
-    aha_type_group,
-};
-
-enum aha_lock_mode
-{
-    aha_lock_unknown = 0,
-    aha_lock_on,
-    aha_lock_off,
-};
-
-enum aha_switch_mode
-{
-    aha_switch_unknown = 0,
-    aha_switch_auto,
-    aha_switch_manual,
-};
-
-enum aha_switch_state
-{
-    aha_swstate_unknown = 0,
-    aha_swstate_on,
-    aha_swstate_off,
-};
-
-enum aha_alarm_mode
-{
-    aha_alarm_unknown = 0,
-    aha_alarm_off,
-    aha_alarm_on,
-};
-
-struct aha_hkr
-{
-    bool present;
-    unsigned long set_temp;
-    unsigned long act_temp;
-    unsigned long comfort_temp;
-    unsigned long eco_temp;
-    unsigned long next_temp;
-    unsigned long next_change;
-    unsigned long batt_low;
-    enum aha_lock_mode lock;
-    enum aha_lock_mode device_lock;
-    unsigned long error;
-};
-
-struct aha_switch
-{
-    bool present;
-    enum aha_switch_state state;
-    enum aha_switch_mode mode;
-    enum aha_lock_mode lock;
-    enum aha_lock_mode device_lock;
-};
-
-struct aha_power
-{
-    bool present;
-    unsigned long power;
-    unsigned long energy;
-};
-
-struct aha_thermo
-{
-    bool present;
-    long temp_c;
-    long offset;
-};
-
-struct aha_alarm
-{
-    bool present;
-    enum aha_alarm_mode mode;
-};
-
-struct aha_group
-{
-    bool present;
-    unsigned long master_dev;
-    unsigned long members[MAX_GROUP_MEMBERS];
-    unsigned int member_cnt;
-};
-
-struct aha_device
-{
-    struct aha_list_head dev_list;
-    struct aha_list_head grp_list;
-    struct aha_list_head member_list;
-    enum aha_entry_type type;
-    char name[MAX_ENTRY_LEN];
-    char identifier[MAX_ENTRY_LEN];
-    char fw_version[MAX_ENTRY_LEN];
-    char manufacturer[MAX_ENTRY_LEN];
-    char product_name[MAX_ENTRY_LEN];
-    unsigned long functions;
-    unsigned long id;
-    unsigned long present;
-    struct aha_device *group;
-    struct aha_group grp;
-    struct aha_switch swi;
-    struct aha_power pwr;
-    struct aha_thermo temp;
-    struct aha_alarm alarm;
-    struct aha_hkr hkr;
-};
-
-static int initialise_state(void)
-{
-    int result;
-
-    result = 0;
-    memset(&state, 0x0, sizeof(state));
-
-    AHA_INIT_LIST_HEAD(&state.dev_head);
-    AHA_INIT_LIST_HEAD(&state.grp_head);
-
-#if defined(ESP_PLATFORM)
-    state.sema = xSemaphoreCreateBinary();
-    if(state.sema == NULL){
-        ESP_LOGE(TAG, "Creating semaphore failed");
-        result = -ENOMEM;
+    data = calloc(sizeof(*data), 1);
+    if(data == NULL){
+        ESP_LOGE(TAG, "Out of memory for aha_data");
+        goto err_out;
     }
-#endif
 
-    return result;
+    kref_init(&(data->ref_cnt));
+    INIT_KLIST_HEAD(&(data->dev_head));
+    INIT_KLIST_HEAD(&(data->grp_head));
+
+err_out:
+    return data;
 }
 
-#if defined(ESP_PLATFORM)
-static esp_err_t event_handler(void *ctx, system_event_t *event)
+static void release_data(struct kref *ref_cnt)
 {
-    switch(event->event_id) {
-    case SYSTEM_EVENT_STA_START:
-        esp_wifi_connect();
-        break;
-    case SYSTEM_EVENT_STA_GOT_IP:
-        xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
-        break;
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-        /* This is a workaround as ESP32 WiFi libs don't currently
-         * auto-reassociate. */
-        esp_wifi_connect();
-        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
-        break;
-    default:
-        break;
+    struct aha_data *data;
+    struct aha_device *device, *group, *tmp_dev, *tmp_grp;
+
+    data = container_of(ref_cnt, struct aha_data, ref_cnt);
+
+    klist_for_each_entry_safe(group, tmp_grp, &(data->grp_head), grp_list)
+    {
+        /* remove all devices from the group's member list */
+        klist_for_each_entry_safe(device, tmp_dev, &(group->member_list), member_list)
+        {
+            klist_del(&(device->member_list));
+            device->group = NULL;
+        }
+
+        /* remove group from group list */
+        klist_del_init(&(group->grp_list));
+
+        free(group);
     }
-    return ESP_OK;
+
+    klist_for_each_entry_safe(device, tmp_dev, &(data->dev_head), dev_list)
+    {
+        /* remove device from device list */
+        klist_del(&(device->dev_list));
+        free(device);
+    }
+
+    free(data);
 }
-
-static void initialise_wifi(void)
-{
-    tcpip_adapter_init();
-    wifi_event_group = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password =  WIFI_PASS,
-        },
-    };
-
-    ESP_LOGI(TAG, "Setting WiFi configuration SSID %s...", wifi_config.sta.ssid);
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-}
-#endif // defined(ESP_PLATFORM)
 
 struct auth_data
 {
-    char user[128];
-    char pass[128];
+    char user[AHA_CFG_MAXLEN];
+    char pass[AHA_CFG_MAXLEN];
     char realm[128];
     char nonce[128];
     char auth[128];
@@ -757,7 +592,7 @@ err_out:
 static int parse_group_entry(dom_t *dom, struct aha_device *entry)
 {
     dom_t *node;
-    char buf[MAX_ENTRY_LEN];
+    char buf[AHA_ENTRY_LEN];
     char *tok, *saveptr;
     unsigned long val;
     int result;
@@ -1007,9 +842,9 @@ static struct aha_device *parse_entry(dom_t *dom)
     }
 
     memset(entry, 0x0, sizeof(*entry));
-    AHA_INIT_LIST_HEAD(&(entry->dev_list));
-    AHA_INIT_LIST_HEAD(&(entry->grp_list));
-    AHA_INIT_LIST_HEAD(&(entry->member_list));
+    INIT_KLIST_HEAD(&(entry->dev_list));
+    INIT_KLIST_HEAD(&(entry->grp_list));
+    INIT_KLIST_HEAD(&(entry->member_list));
 
     if(!strcasecmp(dom->name, "device")){
         entry->type = aha_type_device;
@@ -1108,43 +943,23 @@ err_out:
     return entry;
 }
 
-static void free_devices(void)
-{
-    struct aha_device *device, *group, *tmp_dev, *tmp_grp;
 
-    aha_list_for_each_entry_safe(group, tmp_grp, &(state.grp_head), grp_list)
-    {
-        /* remove all devices from the group's member list */
-        aha_list_for_each_entry_safe(device, tmp_dev, &(group->member_list), member_list)
-        {
-            aha_list_del(&(device->member_list));
-            device->group = NULL;
-        }
-
-        /* remove group from group list */
-        aha_list_del_init(&(group->grp_list));
-
-        free(group);
-    }
-
-    aha_list_for_each_entry_safe(device, tmp_dev, &(state.dev_head), dev_list)
-    {
-        /* remove device from device list */
-        aha_list_del(&(device->dev_list));
-        free(device);
-    }
-}
-
-static int parse_dom(dom_t *dom)
+static struct aha_data *parse_dom(dom_t *dom)
 {
     dom_t *node, *entry;
     struct aha_device *device, *group;
+    struct aha_data *data;
     unsigned int idx;
     int result;
 
-    free_devices();
-
     result = 0;
+
+    data = create_data();
+    if(data == NULL){
+        result = -ENOMEM;
+        goto err_out;
+    }
+
     node = dom_find_node(dom, "devicelist");
     if(node == NULL){
         result = -ENOENT;
@@ -1155,7 +970,7 @@ static int parse_dom(dom_t *dom)
     while(entry != NULL){
         device = parse_entry(entry);
         if(device != NULL){
-            aha_list_add_tail(&(device->grp_list), &(state.grp_head));
+            klist_add_tail(&(device->grp_list), &(data->grp_head));
         }
         entry = dom_find_node(entry->next, "group");
     }
@@ -1164,14 +979,14 @@ static int parse_dom(dom_t *dom)
     while(entry != NULL){
         device = parse_entry(entry);
         if(device != NULL){
-            aha_list_add_tail(&(device->dev_list), &(state.dev_head));
+            klist_add_tail(&(device->dev_list), &(data->dev_head));
 
-            aha_list_for_each_entry(group, &(state.grp_head), grp_list)
+            klist_for_each_entry(group, &(data->grp_head), grp_list)
             {
                 for(idx = 0;idx < group->grp.member_cnt;++idx){
                     if(device->id == group->grp.members[idx]){
                         device->group = group;
-                        aha_list_add_tail(&(device->member_list),
+                        klist_add_tail(&(device->member_list),
                                           &(group->member_list));
                         break;
                     }
@@ -1185,9 +1000,14 @@ static int parse_dom(dom_t *dom)
 
         entry = dom_find_node(entry->next, "device");
     }
-
+    
 err_out:
-    return result;
+    if(result != 0 && data != NULL){
+        aha_data_release(data);
+        data = NULL;
+    }
+
+    return data;
 }
 
 static void dump_hkr(struct aha_hkr *hkr, const char *prefix)
@@ -1264,28 +1084,27 @@ static void dump_device(struct aha_device *dev, const char *prefix)
 
 }
 
-static void dump_state(void)
+static void dump_data(struct aha_data *data)
 {
     struct aha_device *dev, *grp;
 
     /* dump groups and its member devices */
-    aha_list_for_each_entry(grp, &(state.grp_head), grp_list){
+    klist_for_each_entry(grp, &(data->grp_head), grp_list){
         dump_device(grp, "");
-        aha_list_for_each_entry(dev, &(grp->member_list), member_list){
+        klist_for_each_entry(dev, &(grp->member_list), member_list){
             dump_device(dev, " -> ");
         }
     }
 
     /* dump remaining devices not belonging to a group */
-    aha_list_for_each_entry(dev, &(state.dev_head), dev_list){
+    klist_for_each_entry(dev, &(data->dev_head), dev_list){
         if(dev->group == NULL){
             dump_device(dev, "");
         }
     }
 }
 
-#if !defined(TESTDATA_FILE)
-static int check_auth(struct auth_data *data)
+static int check_auth(struct auth_data *auth)
 {
     char buf[128];
     char *req;
@@ -1304,21 +1123,21 @@ static int check_auth(struct auth_data *data)
     }
     memset(req, 0x0, HTTP_REQ_SIZE);
 
-    written = snprintf(buf, sizeof(buf), SID_CHECK, data->sid);
+    written = snprintf(buf, sizeof(buf), SID_CHECK, auth->sid);
     if(written >= sizeof(buf)){
         ESP_LOGE(TAG, "SID check too big");
         result = -EINVAL;
         goto err_out;
     }
 
-    written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf);
+    written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf, aha_cfg.fbox_port);
     if(written >= HTTP_REQ_SIZE){
         ESP_LOGE(TAG, "HTTP SID check too big");
         result = -EINVAL;
         goto err_out;
     }
 
-    result = do_http_req(FBOX_ADDR, FBOX_PORT, &dom, req);
+    result = do_http_req(aha_cfg.fbox_addr, aha_cfg.fbox_port, &dom, req);
     if(result != 0){
         ESP_LOGE(TAG, "HTTP SID check failed");
         goto err_out;
@@ -1326,16 +1145,16 @@ static int check_auth(struct auth_data *data)
 
     node = dom_find_node(dom, "SID");
     if(node && strncmp(node->data, "0000000000000000", 16)){
-        ESP_LOGI(TAG, "SID %s still valid", data->sid);
+        ESP_LOGI(TAG, "SID %s still valid", auth->sid);
         goto err_out;
     }
 
-    result = copy_data_str(dom, "Challenge", data->nonce, sizeof(data->nonce));
+    result = copy_data_str(dom, "Challenge", auth->nonce, sizeof(auth->nonce));
     if(result != 0){
         goto err_out;
     }
 
-    result = gen_sid_auth(data);
+    result = gen_sid_auth(auth);
     if(result != 0){
         ESP_LOGE(TAG, "Generating auth response failed.");
         goto err_out;
@@ -1345,35 +1164,35 @@ static int check_auth(struct auth_data *data)
     dom = NULL;
 
     memset(req, 0x0, HTTP_REQ_SIZE);
-    written = snprintf(buf, sizeof(buf), SID_GET, FBOX_USER, data->nonce,
-            data->auth);
+    written = snprintf(buf, sizeof(buf), SID_GET, auth->user, auth->nonce,
+            auth->auth);
     if(written >= sizeof(buf)){
         ESP_LOGE(TAG, "SID request too big");
         result = -EINVAL;
         goto err_out;
     }
 
-    written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf);
+    written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf, aha_cfg.fbox_addr);
     if(written >= HTTP_REQ_SIZE){
         ESP_LOGE(TAG, "HTTP SID request too big");
         result = -EINVAL;
         goto err_out;
     }
 
-    result = do_http_req(FBOX_ADDR, FBOX_PORT, &dom, req);
+    result = do_http_req(aha_cfg.fbox_addr, aha_cfg.fbox_port, &dom, req);
     if(result != 0){
         ESP_LOGE(TAG, "HTTP SID request failed");
         goto err_out;
     }
 
-    result = copy_data_str(dom, "SID", data->sid, sizeof(data->sid));
-    if(result != 0 || !strcmp(data->sid, "0000000000000000")){
+    result = copy_data_str(dom, "SID", auth->sid, sizeof(auth->sid));
+    if(result != 0 || !strcmp(auth->sid, "0000000000000000")){
         ESP_LOGE(TAG, "Unable to retrieve valid SID");
         result = -EPERM;
         goto err_out;
     }
 
-    ESP_LOGI(TAG, "New SID: %s", data->sid);
+    ESP_LOGI(TAG, "New SID: %s", auth->sid);
 
 err_out:
     if(req != NULL){
@@ -1387,7 +1206,7 @@ err_out:
     return result;
 }
 
-static dom_t *fetch_data(struct auth_data *data)
+static dom_t *fetch_data(struct auth_data *auth)
 {
     char buf[128];
     char *req;
@@ -1406,21 +1225,21 @@ static dom_t *fetch_data(struct auth_data *data)
     }
     memset(req, 0x0, HTTP_REQ_SIZE);
 
-    written = snprintf(buf, sizeof(buf), HKR_REQ, data->sid);
+    written = snprintf(buf, sizeof(buf), HKR_REQ, auth->sid);
     if(written >= sizeof(buf)){
         ESP_LOGE(TAG, "HKR request too big");
         result = -EINVAL;
         goto err_out;
     }
 
-    written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf);
+    written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf, aha_cfg.fbox_addr);
     if(written >= HTTP_REQ_SIZE){
         ESP_LOGE(TAG, "HTTP HKR request too big");
         result = -EINVAL;
         goto err_out;
     }
 
-    result = do_http_req(FBOX_ADDR, FBOX_PORT, &dom, req);
+    result = do_http_req(aha_cfg.fbox_addr, aha_cfg.fbox_port, &dom, req);
     if(result != 0){
         ESP_LOGE(TAG, "HTTP HKR check failed");
         goto err_out;
@@ -1438,28 +1257,6 @@ err_out:
 
     return dom;
 }
-#else
-static int check_auth(struct auth_data *data)
-{
-    return 0;
-}
-
-static dom_t *fetch_data(struct auth_data *data)
-{
-    dom_t *dom;
-
-    dom = NULL;
-    errno = 0;
-    dom = dom_parse_file_name(TESTDATA_FILE);
-    if(dom == NULL){
-        ESP_LOGE(TAG, "Parsing test data file %s failed: %s", TESTDATA_FILE, strerror(errno));
-        goto err_out;
-    }
-
-err_out:
-    return dom;
-}
-#endif
 
 static enum aha_heat_mode dev_need_heat(struct aha_device *dev)
 {
@@ -1507,13 +1304,18 @@ err_out:
     return result;
 }
 
-static enum aha_heat_mode need_heat(void)
+static enum aha_heat_mode need_heat(struct aha_data *data)
 {
     struct aha_device *device;
     enum aha_heat_mode result, tmp;
 
     result = aha_heat_off;
-    aha_list_for_each_entry(device, &(state.dev_head), dev_list){
+
+    if(data == NULL){
+        goto err_out;
+    }
+
+    klist_for_each_entry(device, &(data->dev_head), dev_list){
         tmp = dev_need_heat(device);
         if(tmp >= aha_heat_on){
             ESP_LOGI(TAG,"%s", device->name);
@@ -1521,21 +1323,19 @@ static enum aha_heat_mode need_heat(void)
         }
     }
 
+err_out:
     return result;
 }
 
 static void fire(int on_off)
 {
     ESP_LOGI(TAG, "Fire %s!", on_off == 0 ? "off" : "on");
-#if defined(ESP_PLATFORM)
     gpio_set_level(GPIO_HEAT, on_off == 0 ? 0 : 1);
-#endif
 }
 
 static int gpio_setup(void)
 {
     int result = 0;
-#if defined(ESP_PLATFORM)
     gpio_config_t io_conf;
 
     io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
@@ -1545,21 +1345,208 @@ static int gpio_setup(void)
     io_conf.pull_down_en = 0;
     io_conf.pull_up_en = 0;
     gpio_config(&io_conf);
-#endif
 
     return result;
 }
 
-static void hephaistos_task(void *pvParameters)
+static void timer_cb(TimerHandle_t timer)
+{
+    xEventGroupSetBits(aha_event_group, BIT_TIMER);
+}
+
+esp_err_t aha_set_cfg(struct aha_cfg *cfg, bool reload)
+{
+    esp_err_t result;
+    nvs_handle handle;
+
+    if(aha_cfg_lock == NULL){
+
+        return ESP_ERR_TIMEOUT;
+    }
+
+    result = nvs_open(AHA_NVS_NAMESPC, NVS_READWRITE, &handle);
+    if(result != ESP_OK){
+        return result;
+    }
+
+    if(xSemaphoreTake(aha_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
+        result = ESP_ERR_TIMEOUT;
+        goto err_out;
+    }
+
+    result = nvs_set_str(handle, "fbox_user", cfg->fbox_user);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+    result = nvs_set_str(handle, "fbox_pass", cfg->fbox_pass);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+    result = nvs_set_str(handle, "fbox_addr", cfg->fbox_addr);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+    result = nvs_set_str(handle, "fbox_port", cfg->fbox_port);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+    result = nvs_commit(handle);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+    if(reload){
+        xEventGroupSetBits(aha_event_group, BIT_RELOAD);
+    }
+
+err_out_unlock:
+    xSemaphoreGive(aha_cfg_lock);
+
+err_out:
+    nvs_close(handle);
+
+    return result;
+}
+
+esp_err_t aha_get_cfg(struct aha_cfg *cfg)
+{
+    esp_err_t result;
+    size_t len;
+    nvs_handle handle;
+
+    if(aha_cfg_lock == NULL){
+        return ESP_ERR_TIMEOUT;
+    }
+
+    result = nvs_open(AHA_NVS_NAMESPC, NVS_READONLY, &handle);
+    if(result != ESP_OK){
+        return result;
+    }
+
+    if(xSemaphoreTake(aha_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
+        result = ESP_ERR_TIMEOUT;
+        goto err_out;
+    }
+    
+    memset(cfg, 0x0, sizeof(*cfg));
+
+    len = sizeof(cfg->fbox_user);
+    result = nvs_get_str(handle, "fbox_user", cfg->fbox_user, &len);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+    len = sizeof(cfg->fbox_pass);
+    result = nvs_get_str(handle, "fbox_pass", cfg->fbox_pass, &len);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+    len = sizeof(cfg->fbox_addr);
+    result = nvs_get_str(handle, "fbox_addr", cfg->fbox_addr, &len);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+    len = sizeof(cfg->fbox_port);
+    result = nvs_get_str(handle, "fbox_port", cfg->fbox_port, &len);
+    if(result != ESP_OK){
+        goto err_out_unlock;
+    }
+
+err_out_unlock:
+    xSemaphoreGive(aha_cfg_lock);
+
+err_out:
+    nvs_close(handle);
+
+    return result;
+}
+
+struct aha_data *aha_data_get(void)
+{
+    struct aha_data *data;
+
+    data = NULL;
+    if(aha_data_lock == NULL || curr_aha_data == NULL){
+        goto err_out;
+    }
+
+    if(xSemaphoreTake(aha_data_lock, 100 * portTICK_PERIOD_MS) == pdTRUE){
+        kref_get(&(curr_aha_data->ref_cnt));
+        data = curr_aha_data;
+        xSemaphoreGive(aha_data_lock);
+    }
+
+err_out:
+    return data;
+}
+
+void aha_data_release(struct aha_data *data)
+{
+    if(data != NULL){
+        kref_put(&(data->ref_cnt), release_data);
+    }
+}
+
+void aha_task_suspend(void)
+{
+    xEventGroupSetBits(aha_event_group, BIT_SUSPEND);
+}
+
+void aha_task_resume(void)
+{
+    xEventGroupClearBits(aha_event_group, BIT_SUSPEND);
+}
+
+void avm_aha_task(void *pvParameters)
 {
     int result;
     struct auth_data auth_data;
+    struct aha_data *old_data, *new_data;
     enum aha_heat_mode heat_mode;
+    tcpip_adapter_ip_info_t info;
+    wifi_ap_record_t wapr;
     dom_t *dom;
+    EventBits_t events;
 
-    memset(&auth_data, 0x0, sizeof(auth_data));
-    strcpy(auth_data.user, FBOX_USER);
-    strcpy(auth_data.pass, FBOX_PASS);
+    aha_data_lock = xSemaphoreCreateMutex();
+    if(aha_data_lock == NULL){
+        ESP_LOGE(TAG, "Creating aha_data_lock failed.");
+        goto err_out;
+    }
+
+    aha_cfg_lock = xSemaphoreCreateMutex();
+    if(aha_cfg_lock == NULL){
+        ESP_LOGE(TAG, "Creating aha_cfg_lock failed.");
+        goto err_out;
+    }
+
+    aha_event_group = xEventGroupCreate();
+    if(aha_event_group == NULL){
+        ESP_LOGE(TAG, "Creating aha_event_group failed.");
+        goto err_out;
+    }
+
+    /* Force main loop to wait until released from main task.
+     * Also trigger loading of config from NVS.                       */
+    xEventGroupSetBits(aha_event_group, (BIT_SUSPEND | BIT_RELOAD));
+
+    aha_timer = xTimerCreate("AHA_Timer", pdMS_TO_TICKS(10000), pdTRUE, NULL, timer_cb);
+    if(aha_timer == NULL){
+        ESP_LOGE(TAG, "Creating aha_timer failed.");
+        goto err_out;
+    }
+
+    result = xTimerStart(aha_timer, portMAX_DELAY);
+    if(result == pdFAIL){
+        ESP_LOGE(TAG, "Starting aha_timer failed.");
+        goto err_out;
+    }
 
     result = gpio_setup();
     if(result != 0){
@@ -1567,7 +1554,6 @@ static void hephaistos_task(void *pvParameters)
         goto err_out;
     }
 
-#if defined(ESP_PLATFORM)
     result = esp_task_wdt_init(TWDT_TIMEOUT_S, true);
     if(result != 0){
         ESP_LOGE(TAG, "WDT setup failed.");
@@ -1586,22 +1572,43 @@ static void hephaistos_task(void *pvParameters)
         goto err_out;
     }
 
-    result = esp_task_wdt_reset();
-    if(result != 0){
-        ESP_LOGE(TAG, "WDT reset failed.");
-        goto err_out;
-    }
-#endif
-
     do{
-#if defined(ESP_PLATFORM)
-        gpio_set_level(GPIO_LED, 1);
+        /* Wait for and clear timer bit */
+        events = xEventGroupWaitBits(aha_event_group, BIT_TIMER,
+                                     true, false, portMAX_DELAY);
 
-        /* Wait for the callback to set the CONNECTED_BIT in the
-         * event group.       */
-        xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
-                            false, true, portMAX_DELAY);
-#endif
+        if(events & BIT_SUSPEND){
+            ESP_LOGI(TAG, "Task suspended");
+            goto wait_retry;
+        }
+
+        if(events & BIT_RELOAD){
+            result = aha_get_cfg(&aha_cfg);
+            if(result == ESP_OK){
+            ESP_LOGI(TAG, "Config reloaded");
+                xEventGroupClearBits(aha_event_group, BIT_RELOAD);
+
+                memset(&auth_data, 0x0, sizeof(auth_data));
+                strlcpy(auth_data.user, aha_cfg.fbox_user, sizeof(auth_data.user));
+                strlcpy(auth_data.pass, aha_cfg.fbox_pass, sizeof(auth_data.pass));
+            } else {
+                ESP_LOGI(TAG, "Config reload failed");
+                goto wait_retry;
+            }
+        }
+
+        result = esp_wifi_sta_get_ap_info(&wapr);
+        if(result != ESP_OK){
+            goto wait_retry;
+        }
+
+        result = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &info);
+        if(result != ESP_OK || info.ip.addr == IPADDR_ANY){
+            goto wait_retry;
+        }
+
+        gpio_set_level(GPIO_LED, 1);
+        
         result = check_auth(&auth_data);
         if(result != 0){
             goto wait_retry;
@@ -1613,16 +1620,16 @@ static void hephaistos_task(void *pvParameters)
             goto wait_retry;
         }
 
-        result = parse_dom(dom);
+        new_data = parse_dom(dom);
         dom_free(dom);
-        if(result != 0){
+        if(new_data == NULL){
             ESP_LOGE(TAG, "Parsing data failed");
             goto wait_retry;
         }
 
-        dump_state();
+        dump_data(new_data);
 
-        heat_mode = need_heat();
+        heat_mode = need_heat(new_data);
         switch(heat_mode){
         case aha_heat_on:
             fire(1);
@@ -1635,18 +1642,29 @@ static void hephaistos_task(void *pvParameters)
             break;
         }
 
-#if defined(ESP_PLATFORM)
         gpio_set_level(GPIO_LED, 0);
 
+        ESP_LOGI(TAG, "Free heap before: 0x%x", esp_get_free_heap_size());
+        /* try to replace public aha state data */
+        if(xSemaphoreTake(aha_data_lock, 100 * portTICK_PERIOD_MS) == pdTRUE){
+            old_data = curr_aha_data;
+            curr_aha_data = new_data;
+            if(old_data != NULL){
+                aha_data_release(old_data);
+            }
+            xSemaphoreGive(aha_data_lock);
+        } else {
+            ESP_LOGI(TAG, "Unable to get aha_data_lock for update.");
+            aha_data_release(new_data);
+        }
+        ESP_LOGI(TAG, "Free heap after: 0x%x", esp_get_free_heap_size());
+
+wait_retry:
         result = esp_task_wdt_reset();
         if(result != 0){
             ESP_LOGE(TAG, "WDT reset failed.");
             goto err_out;
         }
-#endif
-
-wait_retry:
-        sleep(10);
     }while(1);
 
 err_out:
@@ -1655,78 +1673,3 @@ err_out:
 
     return;
 }
-#if defined(ESP_PLATFORM)
-static void initialise_sntp(void)
-{
-    ESP_LOGI(TAG, "Initialising SNTP");
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_init();
-}
-
-static void obtain_time(void)
-{
-    xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
-                        false, true, portMAX_DELAY);
-    initialise_sntp();
-
-    // wait for time to be set
-    time_t now = 0;
-    struct tm timeinfo = { 0 };
-    int retry = 0;
-    const int retry_count = 10;
-    while(timeinfo.tm_year < (2016 - 1900) && ++retry < retry_count) {
-        ESP_LOGE(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
-        time(&now);
-        localtime_r(&now, &timeinfo);
-    }
-}
-
-#endif
-void get_time(void)
-{
-    time_t now;
-    struct tm timeinfo;
-    char strftime_buf[64];
-
-#if defined(ESP_PLATFORM)
-    time(&now);
-    localtime_r(&now, &timeinfo);
-
-    // Is time set? If not, tm_year will be (1970 - 1900).
-    if (timeinfo.tm_year < (2016 - 1900)) {
-        ESP_LOGI(TAG, "Time is not set yet. Connecting to WiFi and getting time over NTP.");
-        obtain_time();
-    }
-#endif
-
-    // Set timezone to Eastern Standard Time and print local time
-    setenv("TZ", TIMEZONE, 1);
-    tzset();
-    // update 'now' variable with current time
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-    ESP_LOGI(TAG, "The current date/time is: %s", strftime_buf);
-
-}
-
-#if defined(ESP_PLATFORM)
-void app_main()
-{
-    ESP_ERROR_CHECK(nvs_flash_init());
-    initialise_wifi();
-    //get_time();
-    initialise_state();
-    xTaskCreate(&hephaistos_task, "hephaistos_task", 8192, NULL, 5, NULL);
-}
-#else
-int main(int argc, char **argv)
-{
-    get_time();
-    initialise_state();
-    hephaistos_task(NULL);
-    return 0;
-}
-#endif

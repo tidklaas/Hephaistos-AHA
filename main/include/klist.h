@@ -1,0 +1,112 @@
+/*
+ * This file is part of the Hephaistos-AHA project.
+ * Copyright (C) 2018  Tido Klaassen <tido_hephaistos@4gh.eu>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ */
+ 
+#ifndef _KLIST_H_
+#define _KLIST_H_
+
+/*
+ * Inspired by / stolen from Linux kernel list.h
+ */
+
+#if !defined(offsetof)
+#define offsetof(type, member) ((size_t) &((type *)0)->member)
+#endif
+
+#define container_of(ptr, type, member) ({                  \
+	const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+	(type *)( (char *)__mptr - offsetof(type,member) );})
+
+
+struct klist_head {
+	struct klist_head *next, *prev;
+};
+
+
+#define KLIST_HEAD_INIT(name) { &(name), &(name) }
+
+#define KLIST_HEAD(name) \
+	struct klist_head name = KLIST_HEAD_INIT(name)
+
+static inline void INIT_KLIST_HEAD(struct klist_head *list)
+{
+	list->next = list;
+	list->prev = list;
+}
+
+#define klist_entry(ptr, type, member) \
+    container_of(ptr, type, member)
+
+#define klist_for_each_entry(pos, head, member)                     \
+    for (pos = klist_entry((head)->next, typeof(*pos), member);	    \
+         &pos->member != (head);                                    \
+         pos = klist_entry(pos->member.next, typeof(*pos), member))
+
+#define klist_for_each_entry_safe(pos, n, head, member)             \
+	for (pos = klist_entry((head)->next, typeof(*pos), member),     \
+        n = klist_entry(pos->member.next, typeof(*pos), member);    \
+        &pos->member != (head);                                     \
+        pos = n, n = klist_entry(n->member.next, typeof(*n), member))
+
+static inline int klist_empty(const struct klist_head *head)
+{
+    return head->next == head;
+}
+
+static inline void __klist_add(struct klist_head *_new,
+                               struct klist_head *prev,
+                               struct klist_head *next)
+{
+    next->prev = _new;
+    _new->next = next;
+    _new->prev = prev;
+    prev->next = _new;
+}
+
+static inline void klist_add_tail(struct klist_head *_new,
+                                  struct klist_head *head)
+{
+    __klist_add(_new, head->prev, head);
+}
+
+static inline void __klist_del(struct klist_head *prev,
+                               struct klist_head *next)
+{
+    next->prev = prev;
+    prev->next = next;
+}
+
+static inline void __klist_del_entry(struct klist_head *entry)
+{
+    __klist_del(entry->prev, entry->next);
+}
+
+static inline void klist_del(struct klist_head *entry)
+{
+    __klist_del(entry->prev, entry->next);
+    entry->next = NULL;
+    entry->prev = NULL;
+}
+
+static inline void klist_del_init(struct klist_head *entry)
+{
+    __klist_del_entry(entry);
+    INIT_KLIST_HEAD(entry);
+}
+
+#endif // _KLIST_H_
