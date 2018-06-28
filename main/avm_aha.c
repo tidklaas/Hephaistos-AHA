@@ -14,7 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA  02110-1301, USA.
  */
 
 #include <string.h>
@@ -75,6 +76,7 @@ static SemaphoreHandle_t aha_cfg_lock = NULL;
 
 static TimerHandle_t aha_timer = NULL;
 static EventGroupHandle_t aha_event_group;
+
 const int BIT_TIMER     = BIT0;
 const int BIT_SUSPEND   = BIT1;
 const int BIT_RELOAD    = BIT2;
@@ -88,7 +90,8 @@ static const char *HTTP_REQ =
 
 static const char *SID_CHECK = "/login_sid.lua?sid=%s";
 static const char *SID_GET = "/login_sid.lua?username=%s&response=%s-%s";
-static const char *HKR_REQ = "/webservices/homeautoswitch.lua?switchcmd=getdevicelistinfos&sid=%s";
+static const char *HKR_REQ = "/webservices/homeautoswitch.lua?"
+                             "switchcmd=getdevicelistinfos&sid=%s";
 
 #define HTTP_REQ_SIZE   1024
 
@@ -96,6 +99,8 @@ static const char *HKR_REQ = "/webservices/homeautoswitch.lua?switchcmd=getdevic
  * Once initialised, will always hold a pointer to a valid data set */
 static struct aha_data *curr_aha_data = NULL;
 static SemaphoreHandle_t aha_data_lock = NULL;
+static volatile int data_created = 0;
+static volatile int data_released= 0;
 
 static struct aha_data *create_data(void)
 {
@@ -111,6 +116,9 @@ static struct aha_data *create_data(void)
     INIT_KLIST_HEAD(&(data->dev_head));
     INIT_KLIST_HEAD(&(data->grp_head));
 
+    ++data_created;
+    ESP_LOGI(TAG, "Data created: %d released: %d", data_created, data_released);
+
 err_out:
     return data;
 }
@@ -125,7 +133,8 @@ static void release_data(struct kref *ref_cnt)
     klist_for_each_entry_safe(group, tmp_grp, &(data->grp_head), grp_list)
     {
         /* remove all devices from the group's member list */
-        klist_for_each_entry_safe(device, tmp_dev, &(group->member_list), member_list)
+        klist_for_each_entry_safe(device, tmp_dev,
+                                  &(group->member_list), member_list)
         {
             klist_del(&(device->member_list));
             device->group = NULL;
@@ -145,6 +154,9 @@ static void release_data(struct kref *ref_cnt)
     }
 
     free(data);
+
+    ++data_released;
+    ESP_LOGI(TAG, "Data created: %d released: %d", data_created, data_released);
 }
 
 struct auth_data
@@ -170,7 +182,7 @@ int gen_tr064_auth(struct auth_data *data)
     mbedtls_md5_starts(&ctx);
     mbedtls_md5_update(&ctx, (unsigned char *) data->user, strlen(data->user));
     mbedtls_md5_update(&ctx, (unsigned char *) ":", 1);
-    mbedtls_md5_update(&ctx, (unsigned char *) data->realm, strlen(data->realm));
+    mbedtls_md5_update(&ctx, (unsigned char *) data->realm,strlen(data->realm));
     mbedtls_md5_update(&ctx, (unsigned char *) ":", 1);
     mbedtls_md5_update(&ctx, (unsigned char *) data->pass, strlen(data->pass));
     mbedtls_md5_finish(&ctx, md5sum);
@@ -255,7 +267,8 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
     result = getaddrinfo(host, service, &hints, &info);
 
     if(result != 0 || info == NULL){
-        ESP_LOGE(TAG, "DNS lookup failed err=%d %s info=%p", result, strerror(errno), info);
+        ESP_LOGE(TAG, "DNS lookup failed err=%d %s info=%p",
+                 result, strerror(errno), info);
         goto err_out;
     }
 
@@ -369,7 +382,8 @@ err_out:
     return result;
 }
 
-static int __attribute__((unused)) parse_attr_long(dom_t *dom, const char *name, long *dst)
+static int __attribute__((unused))
+parse_attr_long(dom_t *dom, const char *name, long *dst)
 {
     int result;
     const char *val;
@@ -493,7 +507,8 @@ err_out:
     return result;
 }
 
-static int parse_lock_state(dom_t *dom, const char *name, enum aha_lock_mode *state)
+static int
+parse_lock_state(dom_t *dom, const char *name, enum aha_lock_mode *state)
 {
     unsigned long tmp;
     int result;
@@ -517,7 +532,8 @@ err_out:
     return result;
 }
 
-static int parse_switch_state(dom_t *dom, const char *name, enum aha_switch_state *state)
+static int
+parse_switch_state(dom_t *dom, const char *name, enum aha_switch_state *state)
 {
     unsigned long tmp;
     int result;
@@ -561,7 +577,8 @@ err_out:
     return result;
 }
 
-static int parse_switch_mode(dom_t *dom, const char *name, enum aha_switch_mode *mode)
+static int
+parse_switch_mode(dom_t *dom, const char *name, enum aha_switch_mode *mode)
 {
     int result;
 
@@ -607,7 +624,8 @@ static int parse_group_entry(dom_t *dom, struct aha_device *entry)
 
     result = parse_data_ul(node, "masterdeviceid", &(entry->grp.master_dev));
     if(result != 0 && result != -ENOENT){
-        ESP_LOGE(TAG, "Parsing masterdeviceid failed for entry %s", entry->name);
+        ESP_LOGE(TAG, "Parsing masterdeviceid failed for entry %s",
+                 entry->name);
         goto err_out;
     }
     result = 0;
@@ -620,11 +638,14 @@ static int parse_group_entry(dom_t *dom, struct aha_device *entry)
     }
 
     tok = strtok_r(buf, ",", &saveptr);
-    while(tok != NULL && entry->grp.member_cnt < ARRAY_SIZE(entry->grp.members)){
+    while(tok != NULL
+          && entry->grp.member_cnt < ARRAY_SIZE(entry->grp.members))
+    {
         errno = 0;
         val = strtoul(tok, NULL, 10);
         if(errno != 0){
-            ESP_LOGE(TAG, "Error parsing group members for entry %s", entry->name);
+            ESP_LOGE(TAG, "Error parsing group members for entry %s",
+                     entry->name);
             result = errno;
             goto err_out;
         }
@@ -655,25 +676,29 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
 
     result = parse_data_ul(node, "tist", &(entry->hkr.act_temp));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing actual temperature for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing actual temperature for entry %s",
+                 entry->name);
         goto err_out;
     }
 
     result = parse_data_ul(node, "tsoll", &(entry->hkr.set_temp));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing set temperature for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing set temperature for entry %s",
+                 entry->name);
         goto err_out;
     }
 
     result = parse_data_ul(node, "komfort", &(entry->hkr.comfort_temp));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing comfort temperature for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing comfort temperature for entry %s",
+                 entry->name);
         goto err_out;
     }
 
     result = parse_data_ul(node, "absenk", &(entry->hkr.eco_temp));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing eco temperature for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing eco temperature for entry %s",
+                 entry->name);
         goto err_out;
     }
 
@@ -691,13 +716,15 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
 
     result = parse_data_ul(node, "endperiod", &(entry->hkr.next_change));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing next change time for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing next change time for entry %s",
+                 entry->name);
         goto err_out;
     }
 
     result = parse_data_ul(node, "tchange", &(entry->hkr.next_temp));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing next change temperature for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing next change temperature for entry %s",
+                 entry->name);
         goto err_out;
     }
 
@@ -709,7 +736,8 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
 
     result = parse_lock_state(node, "devicelock", &(entry->hkr.device_lock));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing hkr device lock state for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing hkr device lock state for entry %s",
+                 entry->name);
         goto err_out;
     }
 
@@ -748,13 +776,15 @@ static int parse_swi_entry(dom_t *dom, struct aha_device *entry)
 
     result = parse_lock_state(node, "lock", &(entry->swi.lock));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing switch lock state for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing switch lock state for entry %s",
+                 entry->name);
         goto err_out;
     }
 
     result = parse_lock_state(node, "devicelock", &(entry->swi.device_lock));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing switch device lock state for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing switch device lock state for entry %s",
+                 entry->name);
         goto err_out;
     }
 
@@ -816,7 +846,8 @@ static int parse_temp_entry(dom_t *dom, struct aha_device *entry)
 
     result = parse_data_long(node, "offset", &(entry->temp.offset));
     if(result != 0){
-        ESP_LOGE(TAG, "Error parsing temperature offset for entry %s", entry->name);
+        ESP_LOGE(TAG, "Error parsing temperature offset for entry %s",
+                 entry->name);
         goto err_out;
     }
 
@@ -834,14 +865,13 @@ static struct aha_device *parse_entry(dom_t *dom)
     result = 0;
     entry = NULL;
 
-    entry = malloc(sizeof(*entry));
+    entry = calloc(1, sizeof(*entry));
     if(entry == NULL){
         ESP_LOGE(TAG, "Out of memory parsing device.");
         result = -ENOMEM;
         goto err_out;
     }
 
-    memset(entry, 0x0, sizeof(*entry));
     INIT_KLIST_HEAD(&(entry->dev_list));
     INIT_KLIST_HEAD(&(entry->grp_list));
     INIT_KLIST_HEAD(&(entry->member_list));
@@ -862,25 +892,29 @@ static struct aha_device *parse_entry(dom_t *dom)
         goto err_out;
     }
 
-    result = copy_attr_str(dom, "identifier", entry->identifier, sizeof(entry->identifier));
+    result = copy_attr_str(dom, "identifier", entry->identifier,
+                           sizeof(entry->identifier));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing identifier failed for entry %s", entry->name);
         goto err_out;
     }
 
-    result = copy_attr_str(dom, "fwversion", entry->fw_version, sizeof(entry->fw_version));
+    result = copy_attr_str(dom, "fwversion", entry->fw_version,
+                           sizeof(entry->fw_version));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing fwversion failed for entry %s", entry->name);
         goto err_out;
     }
 
-    result = copy_attr_str(dom, "manufacturer", entry->manufacturer, sizeof(entry->manufacturer));
+    result = copy_attr_str(dom, "manufacturer", entry->manufacturer,
+                           sizeof(entry->manufacturer));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing manufacturer failed for entry %s", entry->name);
         goto err_out;
     }
 
-    result = copy_attr_str(dom, "productname", entry->product_name, sizeof(entry->product_name));
+    result = copy_attr_str(dom, "productname", entry->product_name,
+                           sizeof(entry->product_name));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing productname failed for entry %s", entry->name);
         goto err_out;
@@ -924,13 +958,15 @@ static struct aha_device *parse_entry(dom_t *dom)
 
     result = parse_pwr_entry(dom->child, entry);
     if(result != 0){
-        ESP_LOGE(TAG, "Parsing powermeter info failed for entry %s", entry->name);
+        ESP_LOGE(TAG, "Parsing powermeter info failed for entry %s",
+                 entry->name);
         goto err_out;
     }
 
     result = parse_temp_entry(dom->child, entry);
     if(result != 0){
-        ESP_LOGE(TAG, "Parsing thermometer info failed for entry %s", entry->name);
+        ESP_LOGE(TAG, "Parsing thermometer info failed for entry %s",
+                 entry->name);
         goto err_out;
     }
 
@@ -1115,13 +1151,12 @@ static int check_auth(struct auth_data *auth)
     req = NULL;
     dom = NULL;
 
-    req = malloc(HTTP_REQ_SIZE);
+    req = calloc(1, HTTP_REQ_SIZE);
     if(req == NULL){
         ESP_LOGE(TAG, "Out of memory for request");
         result = -ENOMEM;
         goto err_out;
     }
-    memset(req, 0x0, HTTP_REQ_SIZE);
 
     written = snprintf(buf, sizeof(buf), SID_CHECK, auth->sid);
     if(written >= sizeof(buf)){
@@ -1217,13 +1252,12 @@ static dom_t *fetch_data(struct auth_data *auth)
     req = NULL;
     dom = NULL;
 
-    req = malloc(HTTP_REQ_SIZE);
+    req = calloc(1, HTTP_REQ_SIZE);
     if(req == NULL){
         ESP_LOGE(TAG, "Out of memory for request");
         result = -ENOMEM;
         goto err_out;
     }
-    memset(req, 0x0, HTTP_REQ_SIZE);
 
     written = snprintf(buf, sizeof(buf), HKR_REQ, auth->sid);
     if(written >= sizeof(buf)){
@@ -1509,8 +1543,6 @@ void avm_aha_task(void *pvParameters)
     struct auth_data auth_data;
     struct aha_data *old_data, *new_data;
     enum aha_heat_mode heat_mode;
-    tcpip_adapter_ip_info_t info;
-    wifi_ap_record_t wapr;
     dom_t *dom;
     EventBits_t events;
 
@@ -1536,7 +1568,9 @@ void avm_aha_task(void *pvParameters)
      * Also trigger loading of config from NVS.                       */
     xEventGroupSetBits(aha_event_group, (BIT_SUSPEND | BIT_RELOAD));
 
-    aha_timer = xTimerCreate("AHA_Timer", pdMS_TO_TICKS(10000), pdTRUE, NULL, timer_cb);
+    aha_timer = xTimerCreate("AHA_Timer", pdMS_TO_TICKS(10000), pdTRUE,
+                             NULL, timer_cb);
+
     if(aha_timer == NULL){
         ESP_LOGE(TAG, "Creating aha_timer failed.");
         goto err_out;
@@ -1583,30 +1617,39 @@ void avm_aha_task(void *pvParameters)
         }
 
         if(events & BIT_RELOAD){
+            /* Clear the reload bit before trying to load the config.
+             * This way we will not miss a reload if an update happens
+             * immediately after aha_get_cfg() releases the config mutex */
+            xEventGroupClearBits(aha_event_group, BIT_RELOAD);
+
             result = aha_get_cfg(&aha_cfg);
             if(result == ESP_OK){
-            ESP_LOGI(TAG, "Config reloaded");
-                xEventGroupClearBits(aha_event_group, BIT_RELOAD);
+                ESP_LOGI(TAG, "Config reloaded");
 
                 memset(&auth_data, 0x0, sizeof(auth_data));
-                strlcpy(auth_data.user, aha_cfg.fbox_user, sizeof(auth_data.user));
-                strlcpy(auth_data.pass, aha_cfg.fbox_pass, sizeof(auth_data.pass));
+
+                strlcpy(auth_data.user, aha_cfg.fbox_user,
+                        sizeof(auth_data.user));
+
+                strlcpy(auth_data.pass, aha_cfg.fbox_pass,
+                        sizeof(auth_data.pass));
+
             } else {
                 ESP_LOGI(TAG, "Config reload failed");
+
+                /* Make sure we try again */
+                xEventGroupSetBits(aha_event_group, BIT_RELOAD);
                 goto wait_retry;
             }
         }
 
-        result = esp_wifi_sta_get_ap_info(&wapr);
+        /* Skip data retrieval if we have connectivity or network issues */
+        result = heph_connected();
         if(result != ESP_OK){
             goto wait_retry;
         }
 
-        result = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &info);
-        if(result != ESP_OK || info.ip.addr == IPADDR_ANY){
-            goto wait_retry;
-        }
-
+        /* Everything seems to be in order. Try fetching a new data set */
         gpio_set_level(GPIO_LED, 1);
         
         result = check_auth(&auth_data);
@@ -1629,6 +1672,7 @@ void avm_aha_task(void *pvParameters)
 
         dump_data(new_data);
 
+        /* We have a new data set. Analyse it and update heater control */
         heat_mode = need_heat(new_data);
         switch(heat_mode){
         case aha_heat_on:
@@ -1645,7 +1689,8 @@ void avm_aha_task(void *pvParameters)
         gpio_set_level(GPIO_LED, 0);
 
         ESP_LOGI(TAG, "Free heap before: 0x%x", esp_get_free_heap_size());
-        /* try to replace public aha state data */
+
+        /* Try to update public aha state data */
         if(xSemaphoreTake(aha_data_lock, 100 * portTICK_PERIOD_MS) == pdTRUE){
             old_data = curr_aha_data;
             curr_aha_data = new_data;
@@ -1657,6 +1702,7 @@ void avm_aha_task(void *pvParameters)
             ESP_LOGI(TAG, "Unable to get aha_data_lock for update.");
             aha_data_release(new_data);
         }
+
         ESP_LOGI(TAG, "Free heap after: 0x%x", esp_get_free_heap_size());
 
 wait_retry:

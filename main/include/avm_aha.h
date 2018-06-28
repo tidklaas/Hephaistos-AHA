@@ -28,6 +28,8 @@ struct aha_data
 {
     struct kref ref_cnt;
     time_t timestamp;
+    int status;
+    const char *msg;
     struct klist_head dev_head; // list of all devices
     struct klist_head grp_head; // list of all groups
 };
@@ -162,6 +164,8 @@ struct aha_device
     struct aha_alarm alarm;
     struct aha_hkr hkr;
 };
+
+#define AHA_NEED_CFG (1 << 0)
 
 extern void avm_aha_task(void *pvParameters);
 extern struct aha_data *aha_data_get(void);
