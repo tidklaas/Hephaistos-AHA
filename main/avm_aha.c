@@ -18,6 +18,8 @@
  * MA  02110-1301, USA.
  */
 
+#define _GNU_SOURCE
+
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -27,12 +29,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
-#include <expat.h>
-#include <expat-dom.h>
-#include <klist.h>
-#include <kref.h>
-#include <hephaistos.h>
-#include <avm_aha.h>
+
 #include <sdkconfig.h>
 
 #include "freertos/FreeRTOS.h"
@@ -63,17 +60,22 @@
 #include "mbedtls/certs.h"
 #include "mbedtls/md5.h"
 
-#define GPIO_HEAT       CONFIG_GPIO_HEAT
-#define GPIO_LED        CONFIG_GPIO_LED
+#include <expat.h>
+#include <expat-dom.h>
+#include <klist.h>
+#include <kref.h>
+#include <hephaistos.h>
+#include <avm_aha.h>
 
-#define TWDT_TIMEOUT_S          300
-#define TASK_RESET_PERIOD_S     5
+#define TWDT_TIMEOUT_S  300
+#define TASK_TIMER_S    5
 
 static const char *TAG = "AHA";
 
 static struct aha_cfg aha_cfg;
 static SemaphoreHandle_t aha_cfg_lock = NULL;
 
+static TaskHandle_t this = NULL;
 static TimerHandle_t aha_timer = NULL;
 static EventGroupHandle_t aha_event_group;
 
@@ -196,8 +198,7 @@ int gen_tr064_auth(struct auth_data *data)
     mbedtls_md5_starts(&ctx);
     mbedtls_md5_update(&ctx, md5str, 32);
     mbedtls_md5_update(&ctx, (unsigned char *) ":", 1);
-    mbedtls_md5_update(&ctx, (unsigned char *) data->nonce,
-            strlen(data->nonce));
+    mbedtls_md5_update(&ctx, (unsigned char *)data->nonce, strlen(data->nonce));
     mbedtls_md5_finish(&ctx, md5sum);
     mbedtls_md5_free(&ctx);
 
@@ -251,37 +252,42 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
 {
     char buf[64];
     char *reply;
-    size_t written, len;
+    size_t written, len, offset;
     void *dom_parser;
-    int body, result, sock;
+    int body, result, sock, tmp;
     struct addrinfo hints;
     struct addrinfo *info;
     struct timeval receiving_timeout;
 
     sock = -1;
     info = NULL;
+    *dom = NULL;
+    dom_parser = NULL;
+    errno = 0;
+
     memset(&hints, 0x0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
     result = getaddrinfo(host, service, &hints, &info);
-
     if(result != 0 || info == NULL){
-        ESP_LOGE(TAG, "DNS lookup failed err=%d %s info=%p",
-                 result, strerror(errno), info);
+        ESP_LOGE(TAG, "DNS lookup failed err=%d (%s) info=%p",
+                   result, strerror(errno), info);
         goto err_out;
     }
 
     sock = socket(info->ai_family, info->ai_socktype, 0);
     if(sock < 0){
-        ESP_LOGE(TAG, "... Failed to allocate socket.");
+        ESP_LOGE(TAG, "[%s] Failed to allocate socket: %s",
+                   __func__, strerror(errno));
         result = sock;
         goto err_out;
     }
 
     result = connect(sock, info->ai_addr, info->ai_addrlen);
     if(result != 0){
-        ESP_LOGE(TAG, "... socket connect failed result=%d", result);
+        ESP_LOGE(TAG, "[%s] socket connect failed: %s",
+                   __func__, strerror(errno));
         goto err_out;
     }
 
@@ -291,7 +297,8 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
     while(len > 0){
         result = write(sock, &(req[written]), len);
         if(result < 0){
-            ESP_LOGE(TAG, "... socket send failed");
+            ESP_LOGE(TAG, "[%s] socket send failed: %s",
+                       __func__, strerror(errno));
             goto err_out;
         }
         written += result;
@@ -301,22 +308,24 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
     receiving_timeout.tv_sec = 5;
     receiving_timeout.tv_usec = 0;
     result = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &receiving_timeout,
-            sizeof(receiving_timeout));
+                          sizeof(receiving_timeout));
     if(result < 0){
-        ESP_LOGE(TAG, "... failed to set socket receiving timeout");
+        ESP_LOGE(TAG, "[%s] setsockopt() failed: %s",
+                   __func__, strerror(errno));
         goto err_out;
     }
 
     body = 0;
-    memset(buf, 0x42, 3);
-    dom_parser = NULL;
-
+    offset = 0;
     do{
-        len = sizeof(buf) - 4;
-        bzero(&(buf[3]), sizeof(buf) - 3);
-        result = read(sock, (unsigned char *) &(buf[3]), len);
+        /* Read data chunks from socket. The end-of-header marker might be
+         * spread over multiple reads, so the parser below will tell us the
+         * offset into the read buffer. */
+        len = sizeof(buf) - offset;
+        memset(&(buf[offset]), 0x0, sizeof(buf) - offset);
+        result = read(sock, (unsigned char *) &(buf[offset]), len);
         if(result < 0){
-            ESP_LOGE(TAG, "... failed to set socket receiving timeout");
+            ESP_LOGE(TAG, "[%s] read() failed: %s", __func__, strerror(errno));
             goto err_out;
         }
 
@@ -325,36 +334,72 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
             break;
         }
 
-        len = result;
+        /* We received some data. Set up pointer to buffer and adjust length */
+        len = result + offset;
+        reply = buf;
 
         if(body == 0){
-            reply = strstr(buf, "\r\n\r\n");
+            /* We are looking for "\r\n\r\n" which separates HTTP header and
+             * body.  */
+
+            reply = memmem(buf, len, "\r\n\r\n", 4);
             if(reply == NULL){
-                memmove(buf, &(buf[len]), 3);
-                continue;
+                /* Due to chunked reads we can not rely on the separator being
+                 * received completely in one read. Therefore we move the last
+                 * three bytes to the start of the buffer and continue reading
+                 * from the socket. */
+                memmove(buf, &(buf[len - 3]), 3);
+                offset = 3;
+            } else {
+                /* We found the start of the HTTP body. Adjust reply pointer
+                 * and data length so the rest of the reply can be fed to the
+                 * XML parser. */
+                reply += 4;
+                len -= (reply - buf);
+                offset = 0;
+                body = 1;
             }
-            reply += strlen("\r\n\r\n");
-            len -= (reply - &(buf[3]));
-            body = 1;
-        }else{
-            reply = &buf[3];
         }
 
-        result = dom_parse_chunked_data(&dom_parser, dom, reply, len, 0);
+        if(body == 1){
+            result = dom_parse_chunked_data(&dom_parser, dom, reply, len, 0);
+            if(result != 0){
+                ESP_LOGE(TAG, "[%s] Incremental parse failed: %d",
+                          __func__, result);
+                goto err_out;
+            }
+        }
     }while(1);
 
-    result = dom_parse_chunked_data(&dom_parser, dom, NULL, 0, 1);
-
 err_out:
+    /* If we started parsing XML data, we have to make sure that the parsing
+     * gets finalised. Just calling XML_ParserFree() instead results in a
+     * serious memory leak.                                                   */
+    if(dom_parser != NULL){
+        tmp = dom_parse_chunked_data(&dom_parser, dom, NULL, 0, 1);
+        if(tmp != 0){
+            ESP_LOGE(TAG, "[%s] Final parse failed: %d", __func__, result);
+            if(result == 0){
+                result = tmp;
+            }
+        }
+    }
+
     if(info != NULL){
         freeaddrinfo(info);
     }
 
     if(sock >= 0){
-        close(sock);
+        errno = 0;
+        tmp = close(sock);
+        if(tmp != 0){
+            ESP_LOGE(TAG, "[%s] close() failed: %s", __func__, strerror(errno));
+        }
     }
 
+    /* Release any (partial) DOM on error and make sure we return NULL */
     if(result != 0 && *dom != NULL){
+        ESP_LOGE(TAG, "[%s] Freeing dom", __func__);
         dom_free(*dom);
         *dom = NULL;
     }
@@ -1002,6 +1047,9 @@ static struct aha_data *parse_dom(dom_t *dom)
         goto err_out;
     }
 
+    /* We parse the DOM in two passes. On the first pass we only handle
+     * group entries. This makes sure that all groups are already in the
+     * group-list when we start parsing the "real" devices. */
     entry = dom_find_node(node->child, "group");
     while(entry != NULL){
         device = parse_entry(entry);
@@ -1011,15 +1059,19 @@ static struct aha_data *parse_dom(dom_t *dom)
         entry = dom_find_node(entry->next, "group");
     }
 
+    /* Second pass for the "real" devices. We need to check the entries
+     * in the group-list to see if this device is a member of that group. */
     entry = dom_find_node(node->child, "device");
     while(entry != NULL){
         device = parse_entry(entry);
         if(device != NULL){
             klist_add_tail(&(device->dev_list), &(data->dev_head));
 
+            /* Loop over all groups and their members until we either
+             * find a match or run out of groups to check. */
             klist_for_each_entry(group, &(data->grp_head), grp_list)
             {
-                for(idx = 0;idx < group->grp.member_cnt;++idx){
+                for(idx = 0; idx < group->grp.member_cnt; ++idx){
                     if(device->id == group->grp.members[idx]){
                         device->group = group;
                         klist_add_tail(&(device->member_list),
@@ -1028,6 +1080,7 @@ static struct aha_data *parse_dom(dom_t *dom)
                     }
                 }
 
+                /* Match found, no need to continue. */
                 if(device->group != NULL){
                     break;
                 }
@@ -1200,7 +1253,7 @@ static int check_auth(struct auth_data *auth)
 
     memset(req, 0x0, HTTP_REQ_SIZE);
     written = snprintf(buf, sizeof(buf), SID_GET, auth->user, auth->nonce,
-            auth->auth);
+                        auth->auth);
     if(written >= sizeof(buf)){
         ESP_LOGE(TAG, "SID request too big");
         result = -EINVAL;
@@ -1254,28 +1307,28 @@ static dom_t *fetch_data(struct auth_data *auth)
 
     req = calloc(1, HTTP_REQ_SIZE);
     if(req == NULL){
-        ESP_LOGE(TAG, "Out of memory for request");
+        ESP_LOGE(TAG, "[%s]Out of memory for HTTP AHA request", __func__);
         result = -ENOMEM;
         goto err_out;
     }
 
     written = snprintf(buf, sizeof(buf), HKR_REQ, auth->sid);
     if(written >= sizeof(buf)){
-        ESP_LOGE(TAG, "HKR request too big");
+        ESP_LOGE(TAG, "[%s]HTTP AHA request too big", __func__);
         result = -EINVAL;
         goto err_out;
     }
 
     written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf, aha_cfg.fbox_addr);
     if(written >= HTTP_REQ_SIZE){
-        ESP_LOGE(TAG, "HTTP HKR request too big");
+        ESP_LOGE(TAG, "[%s]HTTP AHA data request too big", __func__);
         result = -EINVAL;
         goto err_out;
     }
 
     result = do_http_req(aha_cfg.fbox_addr, aha_cfg.fbox_port, &dom, req);
     if(result != 0){
-        ESP_LOGE(TAG, "HTTP HKR check failed");
+        ESP_LOGE(TAG, "[%s]HTTP AHA data request failed", __func__);
         goto err_out;
     }
 
@@ -1361,26 +1414,10 @@ err_out:
     return result;
 }
 
-static void fire(int on_off)
+static void fire(bool on)
 {
-    ESP_LOGI(TAG, "Fire %s!", on_off == 0 ? "off" : "on");
-    gpio_set_level(GPIO_HEAT, on_off == 0 ? 0 : 1);
-}
-
-static int gpio_setup(void)
-{
-    int result = 0;
-    gpio_config_t io_conf;
-
-    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = (uint64_t)((1ULL << GPIO_HEAT)
-                                    | (1ULL << GPIO_LED));
-    io_conf.pull_down_en = 0;
-    io_conf.pull_up_en = 0;
-    gpio_config(&io_conf);
-
-    return result;
+    ESP_LOGI(TAG, "Fire %s!", on ? "on" : "off");
+    heph_heat_set(on);
 }
 
 static void timer_cb(TimerHandle_t timer)
@@ -1446,26 +1483,38 @@ err_out:
     return result;
 }
 
-esp_err_t aha_get_cfg(struct aha_cfg *cfg)
+esp_err_t aha_get_cfg(struct aha_cfg *cfg, enum cfg_load_type from)
 {
     esp_err_t result;
     size_t len;
     nvs_handle handle;
 
+    if(from != cfg_ram && from != cfg_nvs){
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if(aha_cfg_lock == NULL){
         return ESP_ERR_TIMEOUT;
     }
 
-    result = nvs_open(AHA_NVS_NAMESPC, NVS_READONLY, &handle);
-    if(result != ESP_OK){
-        return result;
+    if(from == cfg_nvs){
+        result = nvs_open(AHA_NVS_NAMESPC, NVS_READONLY, &handle);
+        if(result != ESP_OK){
+            return result;
+        }
     }
 
     if(xSemaphoreTake(aha_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
         result = ESP_ERR_TIMEOUT;
         goto err_out;
     }
-    
+
+    if(from == cfg_ram){
+        memmove(cfg, &aha_cfg, sizeof(*cfg));
+        result = ESP_OK;
+        goto err_out_unlock;
+    }
+
     memset(cfg, 0x0, sizeof(*cfg));
 
     len = sizeof(cfg->fbox_user);
@@ -1496,7 +1545,9 @@ err_out_unlock:
     xSemaphoreGive(aha_cfg_lock);
 
 err_out:
-    nvs_close(handle);
+    if(from == cfg_nvs){
+        nvs_close(handle);
+    }
 
     return result;
 }
@@ -1529,12 +1580,18 @@ void aha_data_release(struct aha_data *data)
 
 void aha_task_suspend(void)
 {
-    xEventGroupSetBits(aha_event_group, BIT_SUSPEND);
+    if(aha_event_group != NULL){
+        xEventGroupSetBits(aha_event_group, BIT_SUSPEND);
+        (void) esp_task_wdt_delete(this);
+    }
 }
 
 void aha_task_resume(void)
 {
-    xEventGroupClearBits(aha_event_group, BIT_SUSPEND);
+    if(aha_event_group != NULL){
+        xEventGroupClearBits(aha_event_group, BIT_SUSPEND);
+        (void) esp_task_wdt_add(this);
+    }
 }
 
 void avm_aha_task(void *pvParameters)
@@ -1546,21 +1603,29 @@ void avm_aha_task(void *pvParameters)
     dom_t *dom;
     EventBits_t events;
 
+    this = xTaskGetCurrentTaskHandle();
+
+    result = esp_task_wdt_init(TWDT_TIMEOUT_S, true);
+    if(result != 0){
+        ESP_LOGE(TAG, "[%s]WDT setup failed.", __func__);
+        goto err_out;
+    }
+
     aha_data_lock = xSemaphoreCreateMutex();
     if(aha_data_lock == NULL){
-        ESP_LOGE(TAG, "Creating aha_data_lock failed.");
+        ESP_LOGE(TAG, "[%s]Creating aha_data_lock failed.", __func__);
         goto err_out;
     }
 
     aha_cfg_lock = xSemaphoreCreateMutex();
     if(aha_cfg_lock == NULL){
-        ESP_LOGE(TAG, "Creating aha_cfg_lock failed.");
+        ESP_LOGE(TAG, "[%s]Creating aha_cfg_lock failed.", __func__);
         goto err_out;
     }
 
     aha_event_group = xEventGroupCreate();
     if(aha_event_group == NULL){
-        ESP_LOGE(TAG, "Creating aha_event_group failed.");
+        ESP_LOGE(TAG, "[%s]Creating aha_event_group failed.", __func__);
         goto err_out;
     }
 
@@ -1568,29 +1633,17 @@ void avm_aha_task(void *pvParameters)
      * Also trigger loading of config from NVS.                       */
     xEventGroupSetBits(aha_event_group, (BIT_SUSPEND | BIT_RELOAD));
 
-    aha_timer = xTimerCreate("AHA_Timer", pdMS_TO_TICKS(10000), pdTRUE,
+    aha_timer = xTimerCreate("AHA_Timer", pdMS_TO_TICKS(5000), pdTRUE,
                              NULL, timer_cb);
 
     if(aha_timer == NULL){
-        ESP_LOGE(TAG, "Creating aha_timer failed.");
+        ESP_LOGE(TAG, "[%s]Creating aha_timer failed.", __func__);
         goto err_out;
     }
 
     result = xTimerStart(aha_timer, portMAX_DELAY);
     if(result == pdFAIL){
-        ESP_LOGE(TAG, "Starting aha_timer failed.");
-        goto err_out;
-    }
-
-    result = gpio_setup();
-    if(result != 0){
-        ESP_LOGE(TAG, "GPIO setup failed.");
-        goto err_out;
-    }
-
-    result = esp_task_wdt_init(TWDT_TIMEOUT_S, true);
-    if(result != 0){
-        ESP_LOGE(TAG, "WDT setup failed.");
+        ESP_LOGE(TAG, "[%s]Starting aha_timer failed.", __func__);
         goto err_out;
     }
 
@@ -1606,6 +1659,8 @@ void avm_aha_task(void *pvParameters)
         goto err_out;
     }
 
+    srand(esp_get_free_heap_size());
+
     do{
         /* Wait for and clear timer bit */
         events = xEventGroupWaitBits(aha_event_group, BIT_TIMER,
@@ -1613,7 +1668,7 @@ void avm_aha_task(void *pvParameters)
 
         if(events & BIT_SUSPEND){
             ESP_LOGI(TAG, "Task suspended");
-            goto wait_retry;
+            continue;
         }
 
         if(events & BIT_RELOAD){
@@ -1622,7 +1677,7 @@ void avm_aha_task(void *pvParameters)
              * immediately after aha_get_cfg() releases the config mutex */
             xEventGroupClearBits(aha_event_group, BIT_RELOAD);
 
-            result = aha_get_cfg(&aha_cfg);
+            result = aha_get_cfg(&aha_cfg, cfg_nvs);
             if(result == ESP_OK){
                 ESP_LOGI(TAG, "Config reloaded");
 
@@ -1639,35 +1694,39 @@ void avm_aha_task(void *pvParameters)
 
                 /* Make sure we try again */
                 xEventGroupSetBits(aha_event_group, BIT_RELOAD);
-                goto wait_retry;
+                continue;
             }
         }
 
         /* Skip data retrieval if we have connectivity or network issues */
         result = heph_connected();
         if(result != ESP_OK){
-            goto wait_retry;
+            continue;
         }
 
         /* Everything seems to be in order. Try fetching a new data set */
-        gpio_set_level(GPIO_LED, 1);
+        heph_led_set(true);
         
         result = check_auth(&auth_data);
         if(result != 0){
-            goto wait_retry;
+            continue;
         }
 
+        ESP_LOGI(TAG, "Free heap before fetch: 0x%x", esp_get_free_heap_size());
         dom = fetch_data(&auth_data);
+        ESP_LOGI(TAG, "Free heap after fetch: 0x%x", esp_get_free_heap_size());
         if(dom == NULL){
             ESP_LOGI(TAG, "Fetching data failed");
-            goto wait_retry;
+            continue;
         }
 
+        ESP_LOGI(TAG, "Free heap before parse: 0x%x", esp_get_free_heap_size());
         new_data = parse_dom(dom);
         dom_free(dom);
+        ESP_LOGI(TAG, "Free heap after parse: 0x%x", esp_get_free_heap_size());
         if(new_data == NULL){
             ESP_LOGE(TAG, "Parsing data failed");
-            goto wait_retry;
+            continue;
         }
 
         dump_data(new_data);
@@ -1686,9 +1745,9 @@ void avm_aha_task(void *pvParameters)
             break;
         }
 
-        gpio_set_level(GPIO_LED, 0);
+        heph_led_set(false);
 
-        ESP_LOGI(TAG, "Free heap before: 0x%x", esp_get_free_heap_size());
+        ESP_LOGI(TAG, "Free heap before data update: 0x%x", esp_get_free_heap_size());
 
         /* Try to update public aha state data */
         if(xSemaphoreTake(aha_data_lock, 100 * portTICK_PERIOD_MS) == pdTRUE){
@@ -1703,9 +1762,8 @@ void avm_aha_task(void *pvParameters)
             aha_data_release(new_data);
         }
 
-        ESP_LOGI(TAG, "Free heap after: 0x%x", esp_get_free_heap_size());
+        ESP_LOGI(TAG, "Free heap after data update: 0x%x", esp_get_free_heap_size());
 
-wait_retry:
         result = esp_task_wdt_reset();
         if(result != 0){
             ESP_LOGE(TAG, "WDT reset failed.");

@@ -87,7 +87,7 @@ window.onload=function(e) {
         <br>
 
         WiFi password, if applicable: <br />
-        <input type="text" name="passwd" val="%WiFiPasswd%"> <br />
+        <input type="text" name="passwd" value="%WiFiPasswd%"> <br />
         <input type="submit" name="connect" value="Connect!">
     </p>
 </div>

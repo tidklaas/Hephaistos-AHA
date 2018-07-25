@@ -43,6 +43,9 @@
 #include <esp_task_wdt.h>
 #include <nvs_flash.h>
 #include <driver/gpio.h>
+#include <driver/ledc.h>
+#include <esp_intr_alloc.h>
+#include <rom/rtc.h>
 
 #include <lwip/err.h>
 #include <lwip/sockets.h>
@@ -55,24 +58,28 @@
 //#include <libesphttpd/cgiwifi.h>
 #include <http_srv.h>
 
-/* The examples use simple WiFi configuration that you can set via
- 'make menuconfig'.
-
- If you'd rather not, just change the below entries to strings with
- the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
- */
-#define WIFI_SSID       CONFIG_WIFI_SSID
-#define WIFI_PASS       CONFIG_WIFI_PASSWORD
 #define TIMEZONE        CONFIG_TIMEZONE
+#define GPIO_HEAT       CONFIG_GPIO_HEAT
+#define GPIO_LED        CONFIG_GPIO_LED
+#define GPIO_FW_RESET   CONFIG_GPIO_FW_RESET
 
 #define TWDT_TIMEOUT_S          300
 #define TASK_RESET_PERIOD_S     5
+#define FW_RESET_TIME           10
 
 static struct heph_wifi_cfg wifi_cfg;
 static SemaphoreHandle_t wifi_cfg_lock = NULL;
 
 static EventGroupHandle_t heph_event_group;
 static TimerHandle_t heph_timer = NULL;
+static TimerHandle_t fwrst_timer = NULL;
+
+#define HEPH_MAGIC  0x48455048  // "HEPH"
+
+__NOINIT_ATTR static volatile struct _restart_marker {
+    uint32_t magic;
+    uint32_t count;
+} restart_marker;
 
 static const char *TAG = "hephaistos";
 
@@ -92,6 +99,7 @@ static const int BIT_NTP_SYNC      = BIT6;
 static const int BIT_AHA_CFG       = BIT7;
 static const int BIT_AHA_RUN       = BIT8;
 static const int BIT_HTTP_RUN      = BIT9;
+static const int BIT_FW_RESET      = BIT10;
 
 static esp_err_t event_handler(void *ctx, system_event_t *event)
 {
@@ -386,24 +394,37 @@ err_out:
     return result;
 }
 
-esp_err_t heph_get_cfg(struct heph_wifi_cfg *cfg)
+esp_err_t heph_get_cfg(struct heph_wifi_cfg *cfg, enum cfg_load_type from)
 {
     esp_err_t result;
     size_t len;
     nvs_handle handle;
 
+    if(from != cfg_nvs && from != cfg_ram){
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if(wifi_cfg_lock == NULL){
         return ESP_ERR_TIMEOUT;
     }
 
-    result = nvs_open(HEPH_NVS_NAMESPC, NVS_READONLY, &handle);
-    if(result != ESP_OK){
-        return result;
+    if(from == cfg_nvs){
+        result = nvs_open(HEPH_NVS_NAMESPC, NVS_READONLY, &handle);
+        if(result != ESP_OK){
+            return result;
+        }
     }
 
     if(xSemaphoreTake(wifi_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
         result = ESP_ERR_TIMEOUT;
         goto err_out;
+    }
+
+
+    if(from == cfg_ram){
+        memmove(cfg, &wifi_cfg, sizeof(*cfg));
+        result = ESP_OK;
+        goto err_out_unlock;
     }
 
     memset(cfg, 0x0, sizeof(*cfg));
@@ -432,7 +453,9 @@ err_out_unlock:
     xSemaphoreGive(wifi_cfg_lock);
 
 err_out:
-    nvs_close(handle);
+    if(from == cfg_nvs){
+        nvs_close(handle);
+    }
 
     return result;
 }
@@ -440,12 +463,22 @@ err_out:
 static esp_err_t reload_cfg(void)
 {
     esp_err_t result;
+    struct heph_wifi_cfg cfg;
 
-    result = heph_get_cfg(&wifi_cfg);
+    result = heph_get_cfg(&cfg, cfg_nvs);
     if(result != ESP_OK){
         ESP_LOGE(TAG, "[%s] heph_get_cfg() failed", __func__);
         goto err_out;
     }
+
+    if(xSemaphoreTake(wifi_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
+        result = ESP_ERR_TIMEOUT;
+        goto err_out;
+    }
+
+    memmove(&wifi_cfg, &cfg, sizeof(wifi_cfg));
+
+    xSemaphoreGive(wifi_cfg_lock);
 
     setenv("TZ", wifi_cfg.tz, 1);
     tzset();
@@ -460,6 +493,10 @@ err_out:
 
 static void timer_cb(TimerHandle_t timer)
 {
+    if(timer == fwrst_timer){
+        xEventGroupSetBits(heph_event_group, BIT_FW_RESET);
+    }
+
     xEventGroupSetBits(heph_event_group, BIT_TRIGGER);
 }
 
@@ -469,39 +506,192 @@ static esp_err_t check_aha_cfg(void)
     esp_err_t result;
 
     ESP_LOGI(TAG, "Fetching AHA config.");
-    result = aha_get_cfg(&aha_cfg);
+    result = aha_get_cfg(&aha_cfg, cfg_nvs);
     if(result == ESP_OK){
         xEventGroupSetBits(heph_event_group, BIT_AHA_CFG);
         goto err_out;
     }
 
-#if 0
-    if(result != ESP_ERR_TIMEOUT){
-        xEventGroupClearBits(heph_event_group, BIT_AHA_CFG);
+err_out:
+    return result;
+}
 
-        ESP_LOGI(TAG, "Setting default AHA config");
-        strlcpy(aha_cfg.fbox_user, CONFIG_FBOX_USER, sizeof(aha_cfg.fbox_user));
-        strlcpy(aha_cfg.fbox_pass, CONFIG_FBOX_PASSWORD,
-                sizeof(aha_cfg.fbox_pass));
 
-        strlcpy(aha_cfg.fbox_addr, CONFIG_FBOX_ADDR, sizeof(aha_cfg.fbox_addr));
-        strlcpy(aha_cfg.fbox_port, CONFIG_FBOX_PORT, sizeof(aha_cfg.fbox_port));
+static void IRAM_ATTR gpio_isr_handler(void* arg)
+{
+    uint32_t gpio;
+    BaseType_t result, task_woken;
 
-        result = aha_set_cfg(&aha_cfg, true);
-        if(result != ESP_OK){
-            ESP_LOGE(TAG, "Setting AHA config failed, retrying in 5 seconds.");
-        }
+    gpio = (uint32_t) arg;
+    result = pdFAIL;
+    task_woken = pdFALSE;
+
+    if(gpio == GPIO_FW_RESET){
+        result = xEventGroupSetBitsFromISR(heph_event_group,
+                                           BIT_TRIGGER,
+                                           &task_woken);
     }
-#endif
+
+    if(result != pdFAIL && task_woken != pdFALSE){
+        portYIELD_FROM_ISR();
+    }
+}
+
+static esp_err_t setup_gpios(void)
+{
+    gpio_config_t cfg;
+    esp_err_t result;
+
+    result = ESP_OK;
+
+    result = gpio_install_isr_service(0);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] gpio_install_isr_service() failed", __func__);
+        goto err_out;
+    }
+
+    result = gpio_isr_handler_add(GPIO_FW_RESET, gpio_isr_handler,
+                                  (void*) GPIO_FW_RESET);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] gpio_isr_handler_add() failed", __func__);
+        goto err_out;
+    }
+
+    memset(&cfg, 0x0, sizeof(cfg));
+    cfg.pin_bit_mask = (1 << GPIO_FW_RESET);
+    cfg.mode = GPIO_MODE_INPUT;
+    cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    cfg.intr_type = GPIO_INTR_ANYEDGE;
+
+    result = gpio_config(&cfg);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] gpio_config() failed for reset button", __func__);
+        goto err_out;
+    }
+
+    memset(&cfg, 0x0, sizeof(cfg));
+    cfg.pin_bit_mask = (uint64_t)((1ULL << GPIO_HEAT) | (1ULL << GPIO_LED));
+    cfg.mode = GPIO_MODE_OUTPUT;
+    cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    cfg.intr_type = GPIO_PIN_INTR_DISABLE;
+
+    result = gpio_config(&cfg);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] gpio_config() failed for HEAT/LED", __func__);
+        goto err_out;
+    }
 
 err_out:
     return result;
 }
 
+void heph_led_set(bool on)
+{
+    gpio_set_level(GPIO_LED, on ? 1 : 0);
+}
+
+void heph_heat_set(bool on)
+{
+    gpio_set_level(GPIO_HEAT, on ? 1 : 0);
+}
+
+static bool check_fwreset(void)
+{
+    EventBits_t events;
+    BaseType_t timer_running;
+    ledc_timer_config_t ledc_timer;
+    ledc_channel_config_t ledc_channel;
+    bool do_reset;
+    static unsigned int reset_cnt = 0;
+
+    do_reset = false;
+    events = xEventGroupClearBits(heph_event_group, BIT_FW_RESET);
+    timer_running = xTimerIsTimerActive(fwrst_timer);
+
+    if(gpio_get_level(GPIO_FW_RESET) == 1){
+        if(timer_running != pdFALSE){
+            (void) xTimerStop(fwrst_timer, portMAX_DELAY);
+            ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, 0);
+            gpio_matrix_out(GPIO_LED, SIG_GPIO_OUT_IDX, 0, 0);
+            ESP_LOGI(TAG, "[%s] Aborting FW reset", __func__);
+        }
+    } else {
+        if(timer_running == pdFALSE){
+            ESP_LOGI(TAG, "[%s] Starting FW reset timer", __func__);
+            (void) xTimerReset(fwrst_timer, portMAX_DELAY);
+
+            reset_cnt = 0;
+
+            ledc_timer.duty_resolution = LEDC_TIMER_20_BIT;
+            ledc_timer.freq_hz = 5;
+            ledc_timer.speed_mode = LEDC_LOW_SPEED_MODE;
+            ledc_timer.timer_num = LEDC_TIMER_0;
+
+            ledc_timer_config(&ledc_timer);
+
+            ledc_channel.channel = LEDC_CHANNEL_0;
+            ledc_channel.duty = (1 << 19);
+            ledc_channel.gpio_num = GPIO_LED;
+            ledc_channel.speed_mode = LEDC_LOW_SPEED_MODE;
+            ledc_channel.timer_sel = LEDC_TIMER_0;
+
+            ledc_channel_config(&ledc_channel);
+        }
+
+        if((events & BIT_FW_RESET) == BIT_FW_RESET){
+            ++reset_cnt;
+        }
+
+
+        ESP_LOGI(TAG, "[%s] Reset timer count: %d", __func__, reset_cnt);
+
+        if(reset_cnt >= FW_RESET_TIME){
+            ledc_set_duty(ledc_channel.speed_mode, ledc_channel.channel, (1 << 20) - 1);
+            ledc_update_duty(ledc_channel.speed_mode, ledc_channel.channel);
+
+            do_reset = true;
+        }
+    }
+
+    return do_reset;
+}
+
 void app_main()
 {
     EventBits_t events;
+    bool exit, fw_reset;
     esp_err_t result;
+
+    fw_reset = false;
+
+    if(restart_marker.magic != HEPH_MAGIC){
+        ESP_LOGE(TAG, "[%s] Initialising restart marker", __func__);
+        restart_marker.magic = HEPH_MAGIC;
+        restart_marker.count = 0;
+    } else {
+        ESP_LOGE(TAG, "[%s] Found restart marker. Count: %d", __func__, restart_marker.count);
+        ++restart_marker.count;
+    }
+
+    result = setup_gpios();
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "GPIO init failed");
+        goto err_out;
+    }
+
+
+    result = nvs_flash_init();
+    if(result == ESP_ERR_NVS_NO_FREE_PAGES){
+        nvs_flash_erase();
+        result = nvs_flash_init();
+    }
+
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "NVS init failed");
+        goto err_out;
+    }
 
     wifi_cfg_lock = xSemaphoreCreateMutex();
     if(wifi_cfg_lock == NULL){
@@ -515,23 +705,10 @@ void app_main()
         goto err_out;
     }
 
-    // nvs_flash_erase(); // debug only, force setup mode
-
-    result = nvs_flash_init();
-    if(result == ESP_ERR_NVS_NO_FREE_PAGES){
-        nvs_flash_erase();
-        result = nvs_flash_init();
-    }
-
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "NVS init failed");
-        goto err_out;
-    }
-
     init_wifi();
 
     /* put WiFi into setup-mode if there is no configuration in NVS */
-    result = heph_get_cfg(&wifi_cfg);
+    result = heph_get_cfg(&wifi_cfg, cfg_nvs);
     if(result != ESP_OK){
         ESP_LOGI(TAG, "No config in NVS, entering setup mode");
 
@@ -564,12 +741,20 @@ void app_main()
         goto err_out;
     }
 
+    fwrst_timer =
+        xTimerCreate("FWRST_Timer", pdMS_TO_TICKS(2000), pdTRUE, NULL, timer_cb);
+
+    if(fwrst_timer == NULL){
+        ESP_LOGE(TAG, "Creating fwrst_timer failed.");
+        goto err_out;
+    }
+
     http_srv_init();
-    srand(esp_get_free_heap_size());
 
     xEventGroupSetBits(heph_event_group, (BIT_TRIGGER | BIT_RELOAD_CFG));
 
-    while(1){
+    exit = false;
+    while(!exit && !fw_reset){
         events = xEventGroupWaitBits(heph_event_group, BIT_TRIGGER,
                                      true, false, portMAX_DELAY);
 
@@ -581,6 +766,8 @@ void app_main()
                 xEventGroupSetBits(heph_event_group, BIT_RELOAD_CFG);
             }
         }
+
+        fw_reset = check_fwreset();
 
         update_sntp();
 
@@ -601,6 +788,21 @@ void app_main()
                 xEventGroupClearBits(heph_event_group, BIT_AHA_RUN);
             }
         }
+
+        /* If we get here, the firmware seems to be somewhat stable. Clear
+         * the incomplete start marker so we will not fall back to factory
+         * image. */
+        restart_marker.count = 0;
+    }
+
+    if(fw_reset){
+        /* Wait for user to release button. Otherwise bootloader will enter
+         * download mode on reset.   */
+        while(gpio_get_level(GPIO_FW_RESET) == 0)
+            ;
+
+        //nvs_flash_erase();
+        software_reset();
     }
 
 err_out:

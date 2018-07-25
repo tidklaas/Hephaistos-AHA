@@ -20,17 +20,12 @@
 #ifndef _HTTP_SRV_H_
 #define _HTTP_SRV_H_
 
-#define HTTP_NVS_NAMESPC    "http_srv"
-#define HTTP_USER_LEN       32
-#define HTTP_PASS_LEN       32
+#include "heph_types.h"
 
-struct http_srv_cfg {
-    char user[HTTP_USER_LEN];
-    char pass[HTTP_PASS_LEN];
-};
+#define HTTP_NVS_NAMESPC    "http_srv"
 
 extern esp_err_t http_srv_init(void);
-extern esp_err_t http_get_cfg(struct http_srv_cfg *cfg);
+extern esp_err_t http_get_cfg(struct http_srv_cfg *cfg, enum cfg_load_type from);
 extern esp_err_t http_set_cfg(struct http_srv_cfg *cfg, bool reload);
 extern void wifi_scan_done_cb(void);
 

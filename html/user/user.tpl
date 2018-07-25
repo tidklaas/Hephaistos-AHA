@@ -11,8 +11,8 @@
     <p>
         Please enter new user name and password.<br>
 
-        <input type="text" name="user" val="%user%"> <br />
-        <input type="text" name="pass" val="%pass%"> <br />
+        <input type="text" name="user" value="%user%"> <br />
+        <input type="text" name="pass" value="%pass%"> <br />
         <input type="submit" name="connect" value="Update">
     </p>
 </div>

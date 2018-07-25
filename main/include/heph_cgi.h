@@ -16,6 +16,9 @@ extern CgiStatus cgi_wifi_conn_status(HttpdConnData *conn);
 extern int tpl_user(HttpdConnData *conn, char *token, void **arg);
 extern CgiStatus cgi_user_set(HttpdConnData *conn);
 
-extern void wifi_scan_done_cb();
+extern int tpl_ahacfg(HttpdConnData *conn, char *token, void **arg);
+extern CgiStatus cgi_aha_setcfg(HttpdConnData *conn);
+
+extern CgiStatus cgi_aha_dump(HttpdConnData *conn);
 
 #endif // _HEPH_CGI_H_

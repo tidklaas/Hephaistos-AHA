@@ -49,11 +49,7 @@
 #define LISTEN_PORT     80u
 #define MAX_CONNECTIONS 32u
 
-struct http_srv_cfg http_cfg = {
-    .user = "hephaistos",
-    .pass = "fire"
-};
-
+struct http_srv_cfg http_cfg;
 static SemaphoreHandle_t http_cfg_lock = NULL;
 
 static char conn_mem[sizeof(RtosConnType) * MAX_CONNECTIONS];
@@ -81,27 +77,13 @@ int auth_func(HttpdConnData *conn, int idx, char *user, int user_len, char *pass
 #define OTA_FLASH_SIZE_K 1024
 #define OTA_TAGNAME "generic"
 
-CgiUploadFlashDef uploadParams={
+CgiUploadFlashDef upload_params={
 	.type=CGIFLASH_TYPE_FW,
 	.fw1Pos=0x1000,
 	.fw2Pos=((OTA_FLASH_SIZE_K*1024)/2)+0x1000,
 	.fwSize=((OTA_FLASH_SIZE_K*1024)/2)-0x1000,
 	.tagName=OTA_TAGNAME
 };
-
-static int hitCounter=0;
-
-CgiStatus ICACHE_FLASH_ATTR tplCounter(HttpdConnData *connData, char *token, void **arg) {
-        char buff[128];
-        if (token==NULL) return HTTPD_CGI_DONE;
-
-        if (strcmp(token, "counter")==0) {
-                hitCounter++;
-                sprintf(buff, "%d", hitCounter);
-        }
-        httpdSend(connData, buff, -1);
-        return HTTPD_CGI_DONE;
-}
 
 HttpdBuiltInUrl urls_setup[]={
 	ROUTE_AUTH("/*", auth_func),
@@ -121,47 +103,22 @@ HttpdBuiltInUrl urls_setup[]={
     ROUTE_TPL("/user/user.tpl", tpl_user),
     ROUTE_CGI("/user/setuser.cgi", cgi_user_set),
 
-	ROUTE_REDIRECT("/aha", "/aha/aha.tpl"),
-	ROUTE_REDIRECT("/aha/", "/aha/aha.tpl"),
-    ROUTE_TPL("/user/user.tpl", tpl_user),
-    ROUTE_CGI("/user/setuser.cgi", cgi_user_set),
+	ROUTE_REDIRECT("/aha", "/aha/ahadump.cgi"),
+	ROUTE_REDIRECT("/aha/", "/aha/ahadump.cgi"),
+    ROUTE_CGI("/aha/ahadump.cgi", cgi_aha_dump),
+    ROUTE_TPL("/aha/ahacfg.tpl", tpl_ahacfg),
+    ROUTE_CGI("/aha/ahasetcfg.cgi", cgi_aha_setcfg),
 	
+	ROUTE_REDIRECT("/flash", "/flash/index.html"),
+	ROUTE_REDIRECT("/flash/", "/flash/index.html"),
+	ROUTE_CGI_ARG("/flash/next", cgiGetFirmwareNext, &upload_params),
+	ROUTE_CGI_ARG("/flash/upload", cgiUploadFirmware, &upload_params),
+	ROUTE_CGI("/flash/reboot", cgiRebootFirmware),
+
     ROUTE_FILESYSTEM(),
 
 	ROUTE_END()
 };
-
-#if 0
-HttpdBuiltInUrl urls_main[]={
-	ROUTE_CGI_ARG("*", cgiRedirectApClientToHostname, "esp8266.nonet"),
-    ROUTE_AUTH("/*", auth_func);
-    ROUTE_REDIRECT("/", "/index.tpl"),
-
-	ROUTE_TPL("/index.tpl", tplCounter),
-
-	ROUTE_REDIRECT("/flash", "/flash/index.html"),
-	ROUTE_REDIRECT("/flash/", "/flash/index.html"),
-	ROUTE_CGI_ARG("/flash/next", cgiGetFirmwareNext, &uploadParams),
-	ROUTE_CGI_ARG("/flash/upload", cgiUploadFirmware, &uploadParams),
-	ROUTE_CGI("/flash/reboot", cgiRebootFirmware),
-
-	//Routines to make the /wifi URL and everything beneath it work.
-//Enable the line below to protect the WiFi configuration with an username/password combo.
-//	{"/wifi/*", authBasic, auth_func},
-
-	ROUTE_REDIRECT("/wifi", "/wifi/wifi.tpl"),
-	ROUTE_REDIRECT("/wifi/", "/wifi/wifi.tpl"),
-	ROUTE_CGI("/wifi/wifiscan.cgi", cgiWiFiScan),
-	ROUTE_TPL("/wifi/wifi.tpl", tplWlan),
-	ROUTE_CGI("/wifi/connect.cgi", cgiWiFiConnect),
-	ROUTE_CGI("/wifi/connstatus.cgi", cgiWiFiConnStatus),
-	ROUTE_CGI("/wifi/setmode.cgi", cgiWiFiSetMode),
-
-	ROUTE_FILESYSTEM(),
-
-	ROUTE_END()
-};
-#endif
 
 esp_err_t http_set_cfg(struct http_srv_cfg *cfg, bool reload)
 {
@@ -211,24 +168,36 @@ err_out:
     return result;
 }
 
-esp_err_t http_get_cfg(struct http_srv_cfg *cfg)
+esp_err_t http_get_cfg(struct http_srv_cfg *cfg, enum cfg_load_type from)
 {
     esp_err_t result;
     size_t len;
     nvs_handle handle;
 
+    if(from != cfg_nvs && from != cfg_ram){
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if(http_cfg_lock == NULL){
         return ESP_ERR_TIMEOUT;
     }
 
-    result = nvs_open(HTTP_NVS_NAMESPC, NVS_READONLY, &handle);
-    if(result != ESP_OK){
-        return result;
+    if(from == cfg_nvs){
+        result = nvs_open(HTTP_NVS_NAMESPC, NVS_READONLY, &handle);
+        if(result != ESP_OK){
+            return result;
+        }
     }
 
     if(xSemaphoreTake(http_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
         result = ESP_ERR_TIMEOUT;
         goto err_out;
+    }
+
+    if(from == cfg_ram){
+        memmove(cfg, &http_cfg, sizeof(*cfg));
+        result = ESP_OK;
+        goto err_out_unlock;
     }
 
     memset(cfg, 0x0, sizeof(*cfg));
@@ -249,11 +218,13 @@ err_out_unlock:
     xSemaphoreGive(http_cfg_lock);
 
 err_out:
-    nvs_close(handle);
+    if(from == cfg_nvs){
+        nvs_close(handle);
+    }
 
     return result;
 }
-//Main routine. Initialize stdout, the I/O, filesystem and the webserver and we're done.
+
 esp_err_t http_srv_init(void)
 {
     HttpdInitStatus status;
@@ -272,11 +243,13 @@ esp_err_t http_srv_init(void)
         goto err_out;
     }
 
-    result = http_get_cfg(&http_cfg);
-    if(result != ESP_OK && result != ESP_ERR_TIMEOUT){
-        strlcpy(http_cfg.user, "hephaistos", sizeof(http_cfg.user));
-        strlcpy(http_cfg.pass, "fire", sizeof(http_cfg.pass));
-    }
+    do{
+        result = http_get_cfg(&http_cfg, cfg_nvs);
+        if(result != ESP_OK && result != ESP_ERR_TIMEOUT){
+            strlcpy(http_cfg.user, "hephaistos", sizeof(http_cfg.user));
+            strlcpy(http_cfg.pass, "fire", sizeof(http_cfg.pass));
+        }
+    }while(result == ESP_ERR_TIMEOUT);
 
     status = httpdFreertosInit(&httpd_instance,
 	                           urls_setup,
@@ -289,6 +262,8 @@ esp_err_t http_srv_init(void)
        result = ESP_FAIL;
        goto err_out;
     }
+
+    httpdFreertosStart(&httpd_instance);
 
 err_out:
     return result;

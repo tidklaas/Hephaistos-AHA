@@ -20,6 +20,8 @@
 #ifndef _AVM_AHA_
 #define _AVM_AHA_
 
+#include "heph_types.h"
+
 #include <time.h>
 #include "klist.h"
 #include "kref.h"
@@ -36,18 +38,10 @@ struct aha_data
 
 #define AHA_ENTRY_LEN   128
 #define AHA_MAX_MEMBERS 16
-#define AHA_CFG_MAXLEN  64
 #define AHA_NVS_NAMESPC "avm_aha"
 
 #define HEAT_FORCE_ON   0xFE
 #define HEAT_FORCE_OFF  0xFD
-
-struct aha_cfg {
-    char fbox_user[AHA_CFG_MAXLEN];
-    char fbox_pass[AHA_CFG_MAXLEN];
-    char fbox_addr[AHA_CFG_MAXLEN];
-    char fbox_port[AHA_CFG_MAXLEN];
-};
 
 enum aha_heat_mode {
     aha_heat_off = 0,
@@ -165,13 +159,12 @@ struct aha_device
     struct aha_hkr hkr;
 };
 
-#define AHA_NEED_CFG (1 << 0)
 
 extern void avm_aha_task(void *pvParameters);
 extern struct aha_data *aha_data_get(void);
 extern void aha_data_release(struct aha_data *data);
+extern esp_err_t aha_get_cfg(struct aha_cfg *cfg, enum cfg_load_type from);
 extern esp_err_t aha_set_cfg(struct aha_cfg *cfg, bool reload);
-extern esp_err_t aha_get_cfg(struct aha_cfg *cfg);
 extern void aha_task_suspend(void);
 extern void aha_task_resume(void);
 

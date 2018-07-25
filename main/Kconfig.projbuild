@@ -1,39 +1,13 @@
 menu "Hephaistos Configuration"
 
-config WIFI_SSID
-    string "WiFi SSID"
-	default "myssid"
-	help
-		SSID (network name) to connect to.
-
-config WIFI_PASSWORD
-    string "WiFi Password"
-	default "mypass"
-	help
-		WiFi password (WPA or WPA2) to use.
-
-		Can be left blank if the network has no security set.
-
-config FBOX_USER
-    string "F!Box User"
-	default "admin"
-	help
-		F!Box user for login.
-
-config FBOX_PASSWORD
-    string "F!Box Password"
-	default "secret"
-	help
-		Password for logging in to F!Box.
-
 config FBOX_ADDR
-    string "F!Box Address"
+    string "Default F!Box Address"
     default "192.168.178.1"
 	help
 		IP address of F!Box.
 
 config FBOX_PORT
-    string "F!Box Port"
+    string "Default F!Box Port"
 	default "80"
 	help
 		Port to connect to on F!Box.
@@ -48,7 +22,13 @@ config GPIO_LED
     int "LED Control Pin"
 	default 19
 	help
-		GPIO pin used for controlling update indication LED.
+		GPIO pin used for controlling info LED.
+
+config GPIO_FW_RESET
+    int "Factory Reset Button Pin"
+	default 0
+	help
+		GPIO pin used for factory reset button.
 
 config TIMEZONE
     string "Time Zone"
