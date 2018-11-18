@@ -96,6 +96,7 @@ static const char *HKR_REQ = "/webservices/homeautoswitch.lua?"
                              "switchcmd=getdevicelistinfos&sid=%s";
 
 #define HTTP_REQ_SIZE   1024
+#define INVALID_SID     "0000000000000000"
 
 /* Pointer to current aha_data available through aha_data_get().
  * Once initialised, will always hold a pointer to a valid data set */
@@ -216,12 +217,23 @@ int gen_sid_auth(struct auth_data *data)
     unsigned char md5sum[16];
     unsigned char buf[256];
     unsigned int i, curr;
+    int result;
 
+    result = 0;
     memset(data->auth, 0x0, sizeof(data->auth));
+
+    /* Auth request is the hex string of md5-sum of UTF-16LE string
+     * "<nonce>-<password>", where characters must be in the ISO-8859-1
+     * range... m( */
+    if(sizeof(buf) < 2 * (strlen(data->nonce) + strlen(data->pass) + 1)){
+        ESP_LOGE(TAG, "[%s] Auth data too big.", __func__);
+        result = -EINVAL;
+        goto err_out;
+    }
 
     curr = 0;
     memset(buf, 0x0, sizeof(buf));
-    for(i = 0;i < strlen(data->nonce);++i){
+    for(i = 0; i < strlen(data->nonce); ++i){
         buf[curr] = data->nonce[i];
         curr += 2;
     }
@@ -245,7 +257,8 @@ int gen_sid_auth(struct auth_data *data)
         sprintf(&(data->auth[2 * i]), "%02x", md5sum[i]);
     }
 
-    return 0;
+err_out:
+    return result;
 }
 
 static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
@@ -293,7 +306,6 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
 
     written = 0;
     len = strlen(req);
-
     while(len > 0){
         result = write(sock, &(req[written]), len);
         if(result < 0){
@@ -323,6 +335,7 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
          * offset into the read buffer. */
         len = sizeof(buf) - offset;
         memset(&(buf[offset]), 0x0, sizeof(buf) - offset);
+        errno = 0;
         result = read(sock, (unsigned char *) &(buf[offset]), len);
         if(result < 0){
             ESP_LOGE(TAG, "[%s] read() failed: %s", __func__, strerror(errno));
@@ -374,7 +387,7 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
 err_out:
     /* If we started parsing XML data, we have to make sure that the parsing
      * gets finalised. Just calling XML_ParserFree() instead results in a
-     * serious memory leak.                                                   */
+     * serious memory leak. */
     if(dom_parser != NULL){
         tmp = dom_parse_chunked_data(&dom_parser, dom, NULL, 0, 1);
         if(tmp != 0){
@@ -1232,7 +1245,7 @@ static int check_auth(struct auth_data *auth)
     }
 
     node = dom_find_node(dom, "SID");
-    if(node && strncmp(node->data, "0000000000000000", 16)){
+    if(node && strncmp(node->data, INVALID_SID, node->data_len)){
         ESP_LOGI(TAG, "SID %s still valid", auth->sid);
         goto err_out;
     }
@@ -1274,7 +1287,7 @@ static int check_auth(struct auth_data *auth)
     }
 
     result = copy_data_str(dom, "SID", auth->sid, sizeof(auth->sid));
-    if(result != 0 || !strcmp(auth->sid, "0000000000000000")){
+    if(result != 0 || !strcmp(auth->sid, INVALID_SID)){
         ESP_LOGE(TAG, "Unable to retrieve valid SID");
         result = -EPERM;
         goto err_out;
@@ -1370,6 +1383,14 @@ static enum aha_heat_mode dev_need_heat(struct aha_device *dev)
         result = aha_heat_off;
         goto err_out;
     }
+
+#if 0
+    /* F!Box sometimes provides bogus temperature data after reboot. */
+    if(hkr->act_temp == 0){
+        result = aha_heat_keep;
+        goto err_out;
+    }
+#endif
 
     /* do not change heat mode if the target temparature will be set lower than
      * the current actual temperature within the hysteresis time span        */
@@ -1647,6 +1668,7 @@ void avm_aha_task(void *pvParameters)
         goto err_out;
     }
 
+#if 0
     result = esp_task_wdt_add(NULL);
     if(result != 0){
         ESP_LOGE(TAG, "WDT task add failed.");
@@ -1658,6 +1680,7 @@ void avm_aha_task(void *pvParameters)
         ESP_LOGE(TAG, "WDT status check failed.");
         goto err_out;
     }
+#endif
 
     srand(esp_get_free_heap_size());
 
@@ -1667,7 +1690,7 @@ void avm_aha_task(void *pvParameters)
                                      true, false, portMAX_DELAY);
 
         if(events & BIT_SUSPEND){
-            ESP_LOGI(TAG, "Task suspended");
+            ESP_LOGD(TAG, "Task suspended");
             continue;
         }
 

@@ -91,9 +91,10 @@ struct aha_hkr
     unsigned long act_temp;
     unsigned long comfort_temp;
     unsigned long eco_temp;
+    unsigned long batt_low;
+    unsigned long window_open;
     unsigned long next_temp;
     unsigned long next_change;
-    unsigned long batt_low;
     enum aha_lock_mode lock;
     enum aha_lock_mode device_lock;
     unsigned long error;
@@ -128,6 +129,12 @@ struct aha_alarm
     enum aha_alarm_mode mode;
 };
 
+struct aha_button
+{
+    bool present;
+    unsigned long last_pressed;
+};
+
 struct aha_group
 {
     bool present;
@@ -156,6 +163,7 @@ struct aha_device
     struct aha_power pwr;
     struct aha_thermo temp;
     struct aha_alarm alarm;
+    struct aha_button button;
     struct aha_hkr hkr;
 };
 

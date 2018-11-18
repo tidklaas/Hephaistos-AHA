@@ -28,10 +28,11 @@
 #define offsetof(type, member) ((size_t) &((type *)0)->member)
 #endif
 
+#if !defined(container_of)
 #define container_of(ptr, type, member) ({                  \
 	const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 	(type *)( (char *)__mptr - offsetof(type,member) );})
-
+#endif
 
 struct klist_head {
 	struct klist_head *next, *prev;
@@ -52,6 +53,18 @@ static inline void INIT_KLIST_HEAD(struct klist_head *list)
 #define klist_entry(ptr, type, member) \
     container_of(ptr, type, member)
 
+#define klist_first_entry(ptr, type, member) \
+        klist_entry((ptr)->next, type, member)
+
+#define klist_first_entry_or_null(ptr, type, member) \
+        (!klist_empty(ptr) ? klist_first_entry(ptr, type, member) : NULL)
+
+#define klist_next_entry(pos, member) \
+        klist_entry((pos)->member.next, typeof(*(pos)), member)
+
+#define klist_prev_entry(pos, member) \
+        klist_entry((pos)->member.prev, typeof(*(pos)), member)
+
 #define klist_for_each_entry(pos, head, member)                     \
     for (pos = klist_entry((head)->next, typeof(*pos), member);	    \
          &pos->member != (head);                                    \
@@ -66,6 +79,18 @@ static inline void INIT_KLIST_HEAD(struct klist_head *list)
 static inline int klist_empty(const struct klist_head *head)
 {
     return head->next == head;
+}
+
+static inline int klist_is_first(const struct klist_head *list,
+                                 const struct klist_head *head)
+{
+        return list->prev == head;
+}
+
+static inline int klist_is_last(const struct klist_head *list,
+                                const struct klist_head *head)
+{
+        return list->next == head;
 }
 
 static inline void __klist_add(struct klist_head *_new,

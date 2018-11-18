@@ -30,7 +30,7 @@
 #include <libesphttpd/esp.h>
 #include <libesphttpd/httpd.h>
 #include <libesphttpd/httpdespfs.h>
-//#include <libesphttpd/cgiwifi.h>
+#include <libesphttpd/cgiwifi.h>
 #include <libesphttpd/cgiflash.h>
 #include <libesphttpd/auth.h>
 #include <libesphttpd/espfs.h>
@@ -92,11 +92,12 @@ HttpdBuiltInUrl urls_setup[]={
 
 	ROUTE_REDIRECT("/wifi", "/wifi/wifi.tpl"),
 	ROUTE_REDIRECT("/wifi/", "/wifi/wifi.tpl"),
-	ROUTE_TPL("/wifi/wifi.tpl", tpl_wlan),
-	ROUTE_CGI("/wifi/wifiscan.cgi", cgi_wifi_scan),
-	ROUTE_CGI("/wifi/connect.cgi", cgi_wifi_connect),
-	ROUTE_CGI("/wifi/connstatus.cgi", cgi_wifi_conn_status),
-	ROUTE_CGI("/wifi/setmode.cgi", cgi_wifi_set_mode),
+	ROUTE_TPL("/wifi/wifi.tpl", tplWlan),
+	ROUTE_CGI("/wifi/wifiscan.cgi", cgiWiFiScan),
+	ROUTE_CGI("/wifi/connect.cgi", cgiWiFiConnect),
+	ROUTE_CGI("/wifi/connstatus.cgi", cgiWiFiConnStatus),
+	ROUTE_CGI("/wifi/setmode.cgi", cgiWiFiSetMode),
+	ROUTE_CGI("/wifi/startwps.cgi", cgiWiFiStartWps),
 	
 	ROUTE_REDIRECT("/user", "/user/user.tpl"),
 	ROUTE_REDIRECT("/user/", "/user/user.tpl"),

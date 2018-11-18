@@ -37,6 +37,7 @@
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
 #include <esp_wifi.h>
+#include <esp_wps.h>
 #include <esp_event_loop.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -46,6 +47,8 @@
 #include <driver/ledc.h>
 #include <esp_intr_alloc.h>
 #include <rom/rtc.h>
+#include <esp_ota_ops.h>
+#include <esp_image_format.h>
 
 #include <lwip/err.h>
 #include <lwip/sockets.h>
@@ -53,9 +56,9 @@
 #include <lwip/netdb.h>
 #include <lwip/dns.h>
 
-#include <apps/sntp/sntp.h>
+#include <lwip/apps/sntp.h>
 
-//#include <libesphttpd/cgiwifi.h>
+#include <libesphttpd/cgiwifi.h>
 #include <http_srv.h>
 
 #define TIMEZONE        CONFIG_TIMEZONE
@@ -100,6 +103,38 @@ static const int BIT_AHA_CFG       = BIT7;
 static const int BIT_AHA_RUN       = BIT8;
 static const int BIT_HTTP_RUN      = BIT9;
 static const int BIT_FW_RESET      = BIT10;
+static const int BIT_UPD_WIFICFG   = BIT11;
+
+const char *wifi_reasons[] = {
+    [1] = "UNSPECIFIED",
+    [2] = "AUTH_EXPIRE",
+    [3] = "AUTH_LEAVE",
+    [4] = "ASSOC_EXPIRE",
+    [5] = "ASSOC_TOOMANY",
+    [6] = "NOT_AUTHED",
+    [7] = "NOT_ASSOCED",
+    [8] = "ASSOC_LEAVE",
+    [9] = "ASSOC_NOT_AUTHED",
+    [10] = "DISASSOC_PWRCAP_BAD",
+    [11] = "DISASSOC_SUPCHAN_BAD",
+    [13] = "IE_INVALID",
+    [14] = "MIC_FAILURE",
+    [15] = "4WAY_HANDSHAKE_TIMEOUT",
+    [16] = "GROUP_KEY_UPDATE_TIMEOUT",
+    [17] = "IE_IN_4WAY_DIFFERS",
+    [18] = "GROUP_CIPHER_INVALID",
+    [19] = "PAIRWISE_CIPHER_INVALID",
+    [20] = "AKMP_INVALID",
+    [21] = "UNSUPP_RSN_IE_VERSION",
+    [22] = "INVALID_RSN_IE_CAP",
+    [23] = "802_1X_AUTH_FAILED",
+    [24] = "CIPHER_SUITE_REJECTED",
+    [200] = "BEACON_TIMEOUT",
+    [201] = "NO_AP_FOUND",
+    [202] = "AUTH_FAIL",
+    [203] = "ASSOC_FAIL",
+    [204] = "HANDSHAKE_TIMEOUT",
+};
 
 static esp_err_t event_handler(void *ctx, system_event_t *event)
 {
@@ -115,13 +150,30 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
         xEventGroupClearBits(heph_event_group, BIT_STA_STARTED);
         break;
     case SYSTEM_EVENT_STA_GOT_IP:
-        xEventGroupSetBits(heph_event_group, BIT_STA_CONNECTED);
+        xEventGroupSetBits(heph_event_group,
+                           (BIT_STA_CONNECTED | BIT_UPD_WIFICFG));
+        break;
+    case SYSTEM_EVENT_STA_LOST_IP:
+        xEventGroupClearBits(heph_event_group, BIT_STA_CONNECTED);
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
         /* This is a workaround as ESP32 WiFi libs don't currently
          * auto-reassociate. */
         xEventGroupClearBits(heph_event_group, BIT_STA_CONNECTED);
-        esp_wifi_connect();
+        if(wifi_reasons[event->event_info.disconnected.reason]){
+            ESP_LOGE(TAG, "[%s] STA_DISCONNECTED: %s", __FUNCTION__,
+                     wifi_reasons[event->event_info.disconnected.reason]);
+        } 
+        switch(event->event_info.disconnected.reason){                         
+        case WIFI_REASON_NO_AP_FOUND:
+        case WIFI_REASON_ASSOC_LEAVE:
+        case WIFI_REASON_AUTH_FAIL:
+            break;
+        default:
+            esp_wifi_connect();
+            break;
+        }
+
         break;
     case SYSTEM_EVENT_AP_START:
         xEventGroupSetBits(heph_event_group, BIT_AP_STARTED);
@@ -151,12 +203,11 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
 
         xEventGroupClearBits(heph_event_group, BIT_AP_CONNECTED);
         break;
-    case SYSTEM_EVENT_SCAN_DONE:
-        wifi_scan_done_cb();
-        break;
     default:
         break;
     }
+
+    cgiWifiEventCb(event);
 
     /* Wake up main task */
     xEventGroupSetBits(heph_event_group, BIT_TRIGGER);
@@ -173,7 +224,7 @@ init_wifi_cfg(struct heph_wifi_cfg *heph_cfg, struct heph_state *state)
     memset(cfg, 0x0, sizeof(*cfg));
 
     strlcpy((char *) cfg->ap.ssid, HEPH_AP_SSID, sizeof(cfg->ap.ssid));
-    cfg->ap.max_connection = 1;
+    cfg->ap.max_connection = 3;
     cfg->ap.authmode = WIFI_AUTH_OPEN;
 
     cfg = &(state->st_cfg);
@@ -242,6 +293,12 @@ static esp_err_t init_wifi(void)
 
     tcpip_adapter_init();
 
+    result = initCgiWifi();
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] initCgiWifi() failed", __func__);
+        goto err_out;
+    }
+    
     result = esp_event_loop_init(event_handler, NULL);
     if(result != ESP_OK){
         ESP_LOGE(TAG, "[%s] esp_event_loop_init() failed", __func__);
@@ -320,7 +377,7 @@ static void update_sntp(void)
         }
 
 
-        events =  xEventGroupGetBits(heph_event_group);
+        events = xEventGroupGetBits(heph_event_group);
         if(!(events & BIT_NTP_SYNC)){
             time(&now);
             memset(&tm, 0x0, sizeof(tm));
@@ -420,7 +477,6 @@ esp_err_t heph_get_cfg(struct heph_wifi_cfg *cfg, enum cfg_load_type from)
         goto err_out;
     }
 
-
     if(from == cfg_ram){
         memmove(cfg, &wifi_cfg, sizeof(*cfg));
         result = ESP_OK;
@@ -489,6 +545,58 @@ static esp_err_t reload_cfg(void)
 
 err_out:
     return result;
+}
+
+static void update_wifi_cfg(void)
+{
+    EventBits_t events;
+    wifi_config_t wifi_cfg;
+    wifi_sta_config_t *sta;
+    wifi_mode_t mode;
+    struct heph_wifi_cfg heph_cfg;
+    esp_err_t result;
+
+    events = xEventGroupClearBits(heph_event_group, BIT_UPD_WIFICFG);
+    
+    result = esp_wifi_get_mode(&mode);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] esp_wifi_get_mode() failed", __func__);
+        goto err_out;
+    }
+
+    if(mode != WIFI_MODE_STA || !(events & BIT_STA_CONNECTED)){
+       goto err_out;
+    }
+
+    result = esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] esp_wifi_get_config() failed", __func__);
+        goto err_out;
+    }
+
+    memset(&heph_cfg, 0x0, sizeof(heph_cfg));
+    result = heph_get_cfg(&heph_cfg, cfg_nvs);
+    if(result == ESP_ERR_TIMEOUT){
+        xEventGroupSetBits(heph_event_group, BIT_UPD_WIFICFG);
+        goto err_out;
+    }
+
+    sta = &wifi_cfg.sta;
+    if(   strncmp(heph_cfg.ssid, (char *)sta->ssid, sizeof(sta->ssid))
+       || strncmp(heph_cfg.pass, (char *)sta->password, sizeof(sta->password)))
+    {
+        strlcpy(heph_cfg.ssid, (char *)sta->ssid, sizeof(heph_cfg.ssid));
+        strlcpy(heph_cfg.pass, (char *)sta->password, sizeof(heph_cfg.pass));
+        result = heph_set_cfg(&heph_cfg, true);
+        if(result != ESP_OK){
+            ESP_LOGE(TAG, "[%s] heph_set_config() failed", __func__);
+            xEventGroupSetBits(heph_event_group, BIT_UPD_WIFICFG);
+            goto err_out;
+        }
+    }
+
+err_out:
+    return;
 }
 
 static void timer_cb(TimerHandle_t timer)
@@ -597,12 +705,21 @@ void heph_heat_set(bool on)
     gpio_set_level(GPIO_HEAT, on ? 1 : 0);
 }
 
+/** \brief Handle user factory reset request.
+ *
+ * Check if user pressed button for FW_RESET_TIME seconds. Give visual
+ * feedback via the info LED.
+ *
+ * \returns true if factory reset should be performwed, false otherwise
+ */
 static bool check_fwreset(void)
 {
     EventBits_t events;
     BaseType_t timer_running;
     ledc_timer_config_t ledc_timer;
     ledc_channel_config_t ledc_channel;
+    ledc_channel_t chan;
+    ledc_mode_t mode;
     bool do_reset;
     static unsigned int reset_cnt = 0;
 
@@ -610,14 +727,10 @@ static bool check_fwreset(void)
     events = xEventGroupClearBits(heph_event_group, BIT_FW_RESET);
     timer_running = xTimerIsTimerActive(fwrst_timer);
 
-    if(gpio_get_level(GPIO_FW_RESET) == 1){
-        if(timer_running != pdFALSE){
-            (void) xTimerStop(fwrst_timer, portMAX_DELAY);
-            ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, 0);
-            gpio_matrix_out(GPIO_LED, SIG_GPIO_OUT_IDX, 0, 0);
-            ESP_LOGI(TAG, "[%s] Aborting FW reset", __func__);
-        }
-    } else {
+    if(gpio_get_level(GPIO_FW_RESET) == 0){
+        /* Button is (still) pressed. If reset timer is not already running,
+         * start it and initialise the reset counter. Also configure the LED
+         * GPIO to blink rapidly. */
         if(timer_running == pdFALSE){
             ESP_LOGI(TAG, "[%s] Starting FW reset timer", __func__);
             (void) xTimerReset(fwrst_timer, portMAX_DELAY);
@@ -640,39 +753,85 @@ static bool check_fwreset(void)
             ledc_channel_config(&ledc_channel);
         }
 
+        /* Increase the counter if the fw_reset_timer has expired since
+         * the last call to this function */
         if((events & BIT_FW_RESET) == BIT_FW_RESET){
             ++reset_cnt;
         }
 
-
         ESP_LOGI(TAG, "[%s] Reset timer count: %d", __func__, reset_cnt);
 
+        /* Button has been pressed for at least FW_RESET_TIME seconds.
+         * Change LED duty cycle to constant on and set return value
+         * to true. */
         if(reset_cnt >= FW_RESET_TIME){
-            ledc_set_duty(ledc_channel.speed_mode, ledc_channel.channel, (1 << 20) - 1);
-            ledc_update_duty(ledc_channel.speed_mode, ledc_channel.channel);
+            chan = ledc_channel.channel;
+            mode = ledc_channel.speed_mode;
+
+            ledc_set_duty(mode, chan, (1 << 20) - 1);
+            ledc_update_duty(mode, chan);
 
             do_reset = true;
+        }
+    } else {
+        /* Button is not pressed. If reset timer is running, stop it and
+         * restore LED config to normal function. */
+        if(timer_running != pdFALSE){
+            (void) xTimerStop(fwrst_timer, portMAX_DELAY);
+            ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, 0);
+            gpio_matrix_out(GPIO_LED, SIG_GPIO_OUT_IDX, 0, 0);
+            ESP_LOGI(TAG, "[%s] Aborting FW reset", __func__);
         }
     }
 
     return do_reset;
 }
 
-void app_main()
+void app_main(void)
 {
     EventBits_t events;
     bool exit, fw_reset;
+    const esp_partition_t *curr_part;
+    esp_image_header_t img_hdr;
     esp_err_t result;
 
     fw_reset = false;
 
+    /* Check firmware startup failsafe. Clear NVS if firmware is boot
+     * looping and fall back to previous image. */
     if(restart_marker.magic != HEPH_MAGIC){
         ESP_LOGE(TAG, "[%s] Initialising restart marker", __func__);
         restart_marker.magic = HEPH_MAGIC;
         restart_marker.count = 0;
     } else {
-        ESP_LOGE(TAG, "[%s] Found restart marker. Count: %d", __func__, restart_marker.count);
+        ESP_LOGE(TAG, "[%s] Found restart marker. Count: %d", __func__,
+                   restart_marker.count);
         ++restart_marker.count;
+        if(restart_marker.count > 10){
+            ESP_LOGE(TAG, "Firmware is boot looping, initialising"
+                          "fall-back to previous image.");
+
+            /* Invalidate the running image by zeroing out the image's
+             * header in the SPI flash. Bootloader should fall back to
+             * the last valid image before the OTA. */
+
+            curr_part = esp_ota_get_running_partition();
+
+            /* Make sure not to kill the factory image! */
+            if(   curr_part != NULL
+               && curr_part->type == ESP_PARTITION_TYPE_APP
+               && curr_part->subtype != ESP_PARTITION_SUBTYPE_APP_FACTORY)
+            {
+                memset(&img_hdr, 0x0, sizeof(img_hdr));
+                esp_partition_write(curr_part, 0x0, &img_hdr, sizeof(img_hdr));
+            }
+
+            /* Clear NVS and reset marker count. */
+            nvs_flash_erase();
+            restart_marker.count = 0;
+
+            software_reset();
+        }
     }
 
     result = setup_gpios();
@@ -680,7 +839,6 @@ void app_main()
         ESP_LOGE(TAG, "GPIO init failed");
         goto err_out;
     }
-
 
     result = nvs_flash_init();
     if(result == ESP_ERR_NVS_NO_FREE_PAGES){
@@ -727,8 +885,8 @@ void app_main()
 
     xTaskCreate(&avm_aha_task, "avm_aha_task", 8192, NULL, 5, NULL);
 
-    heph_timer =
-        xTimerCreate("HEPH_Timer", pdMS_TO_TICKS(5000), pdTRUE, NULL, timer_cb);
+    heph_timer = xTimerCreate("HEPH_Timer", pdMS_TO_TICKS(5000),
+                              pdTRUE, NULL, timer_cb);
 
     if(heph_timer == NULL){
         ESP_LOGE(TAG, "Creating heph_timer failed.");
@@ -741,8 +899,8 @@ void app_main()
         goto err_out;
     }
 
-    fwrst_timer =
-        xTimerCreate("FWRST_Timer", pdMS_TO_TICKS(2000), pdTRUE, NULL, timer_cb);
+    fwrst_timer = xTimerCreate("FWRST_Timer", pdMS_TO_TICKS(2000),
+                               pdTRUE, NULL, timer_cb);
 
     if(fwrst_timer == NULL){
         ESP_LOGE(TAG, "Creating fwrst_timer failed.");
@@ -757,6 +915,10 @@ void app_main()
     while(!exit && !fw_reset){
         events = xEventGroupWaitBits(heph_event_group, BIT_TRIGGER,
                                      true, false, portMAX_DELAY);
+
+        if(events & BIT_UPD_WIFICFG){
+            update_wifi_cfg();
+        }
 
         if(events & BIT_RELOAD_CFG){
             ESP_LOGI(TAG, "Reloading config");
@@ -790,7 +952,7 @@ void app_main()
         }
 
         /* If we get here, the firmware seems to be somewhat stable. Clear
-         * the incomplete start marker so we will not fall back to factory
+         * the incomplete start marker so we will not fall back to previous
          * image. */
         restart_marker.count = 0;
     }
@@ -801,11 +963,12 @@ void app_main()
         while(gpio_get_level(GPIO_FW_RESET) == 0)
             ;
 
-        //nvs_flash_erase();
+        nvs_flash_erase();
         software_reset();
     }
 
 err_out:
+
     ESP_LOGE(TAG, "Enter error state");
     while(1)
         ;
