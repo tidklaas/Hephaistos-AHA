@@ -29,15 +29,16 @@
 
 #include <libesphttpd/esp.h>
 #include <libesphttpd/httpd.h>
-#include <libesphttpd/httpdespfs.h>
 #include <libesphttpd/cgiwifi.h>
 #include <libesphttpd/cgiflash.h>
 #include <libesphttpd/auth.h>
-#include <libesphttpd/espfs.h>
 #include <libesphttpd/captdns.h>
-#include <libesphttpd/webpages-espfs.h>
 #include <libesphttpd/httpd-freertos.h>
 #include <libesphttpd/route.h>
+
+#include <espfs.h>
+#include <espfs_image.h>
+#include <libesphttpd/httpd-espfs.h>
 
 #include <hephaistos.h>
 #include <avm_aha.h>
@@ -239,7 +240,7 @@ esp_err_t http_srv_init(void)
         goto err_out;
     }
 
-    if(espFsInit((void*)(webpages_espfs_start)) != ESPFS_INIT_RESULT_OK){
+    if(espFsInit((void*)(image_espfs_start)) != ESPFS_INIT_RESULT_OK){
         result = ESP_FAIL;
         goto err_out;
     }
