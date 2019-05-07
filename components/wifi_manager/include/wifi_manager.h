@@ -15,12 +15,14 @@ struct scan_data {
 /* Holds complete WiFi config for both STA and AP, the mode and whether       *\
 \* the WiFi should connect to an AP in STA or APSTA mode.                     */
 struct wifi_cfg {
-    bool connect;
     wifi_mode_t mode;
-    wifi_config_t sta;
     wifi_config_t ap;
+    tcpip_adapter_ip_info_t ap_ip_info;
+    wifi_config_t sta;
+    tcpip_adapter_ip_info_t sta_ip_info;
+    tcpip_adapter_dns_info_t sta_dns_info[TCPIP_ADAPTER_DNS_MAX];
     bool sta_static;
-    tcpip_adapter_ip_info_t static_cfg;
+    bool sta_connect;
 };
 
 esp_err_t esp_wmngr_init(void);

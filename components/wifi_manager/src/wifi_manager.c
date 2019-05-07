@@ -2,21 +2,26 @@
 #include <stdatomic.h>
 #include <errno.h>
 
-#include <freertos/FreeRTOS.h>
-#include <freertos/timers.h>
-#include <freertos/event_groups.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+#include "freertos/event_groups.h"
 
-#include <esp_event_loop.h>
-#include <esp_wifi_types.h>
-#include <esp_wifi.h>
-#include <esp_wps.h>
-#include <esp_log.h>
-#include <esp_err.h>
+#include "esp_event_loop.h"
+#include "esp_wifi_types.h"
+#include "esp_wifi.h"
+#include "esp_wps.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "nvs_flash.h"
 
-#include <wifi_manager.h>
-#include <kref.h>
+#include "lwip/ip4.h"
+
+#include "wifi_manager.h"
+#include "kref.h"
 
 static const char *TAG = "wifimngr";
+
+#define WMNGR_NAMESPACE "esp_wmngr"
 
 #define MAX_NUM_APS     32
 #define SCAN_TIMEOUT    (60 * 1000 / portTICK_PERIOD_MS)
@@ -37,6 +42,15 @@ static const char *TAG = "wifimngr";
         (typecheck(unsigned int, a) && \
          typecheck(unsigned int, b) && \
          ((long)((b) - (a)) < 0))
+
+struct scan_data_ref {
+    struct kref ref_cnt;
+    struct scan_data data;
+};
+
+#if !defined(ARRAY_SIZE)
+#define ARRAY_SIZE(a)   (sizeof(a) / sizeof(*a))
+#endif
 
 /* States used during WiFi (re)configuration. */
 enum cfg_state {
@@ -70,57 +84,96 @@ const char *state_names[] = {
 \* update_wifi() on how to use this.                                     */
 struct wifi_cfg_state {
     SemaphoreHandle_t lock;
-    TickType_t timestamp;
+    TickType_t cfg_timestamp;
     enum cfg_state state;
     struct wifi_cfg saved;
+    struct wifi_cfg current;
     struct wifi_cfg new;
+    TickType_t scan_timestamp;
+    struct scan_data_ref *scan_ref;
 };
 
 static struct wifi_cfg_state cfg_state;
 
 /* For keeping track of system events. */
-#define BIT_CONNECTED       BIT0
-#define BIT_GOT_IP          BIT1
-#define BIT_DISCONNECTED    BIT2
-#define BIT_SCAN_DONE       BIT3
-#define BIT_WPS_SUCCESS     BIT4
-#define BIT_WPS_FAILED      BIT5
+#define BIT_TRIGGER             BIT0
+#define BIT_STA_START           BIT1
+#define BIT_STA_CONNECTED       BIT2
+#define BIT_STA_GOT_IP          BIT3
+#define BIT_AP_START            BIT4
+#define BIT_SCAN_START          BIT5
+#define BIT_SCAN_DONE           BIT6
+#define BIT_WPS_SUCCESS         BIT7
+#define BIT_WPS_FAILED          BIT8
 #define BITS_WPS    (BIT_WPS_SUCCESS | BIT_WPS_FAILED)
 
 static EventGroupHandle_t wifi_events = NULL;
-
-struct scan_data_ref {
-    struct kref ref_cnt;
-    struct scan_data data;
-};
 
 struct ap_data_iter{
     struct scan_data *data;
     uint16_t idx;
 };
 
-
-static volatile atomic_bool scan_in_progress = ATOMIC_VAR_INIT(false);
-static SemaphoreHandle_t data_lock = NULL;
-static struct scan_data_ref *last_scan = NULL;
-static TimerHandle_t *scan_timer = NULL;
 static TimerHandle_t *config_timer = NULL;
 
-static void handle_scan_timer(TimerHandle_t timer);
-static void handle_config_timer(TimerHandle_t timer);
+static void handle_timer(TimerHandle_t timer);
+
+static esp_err_t set_defaults(struct wifi_cfg *cfg)
+{
+    esp_err_t result;
+    size_t len;
+
+    result = ESP_OK;
+
+    memset(cfg, 0x0, sizeof(*cfg));
+    cfg->mode = WIFI_MODE_AP;
+   
+    if(!(ip4addr_aton(CONFIG_WMNGR_AP_IP, &(cfg->ap_ip_info.ip)))){
+        ESP_LOGE(TAG, "[%s] Invalid default AP IP: %s. "
+                      "Using 192.168.4.1 instead.",
+                      __FUNCTION__, CONFIG_WMNGR_AP_IP);
+        IP4_ADDR(&(cfg->ap_ip_info.ip), 192, 168, 4, 1);
+    }
+
+    if(!(ip4addr_aton(CONFIG_WMNGR_AP_MASK, &(cfg->ap_ip_info.netmask)))){
+        ESP_LOGE(TAG, "[%s] Invalid default AP netmask: %s. "
+                      "Using 255.255.255.0 instead.",
+                      __FUNCTION__, CONFIG_WMNGR_AP_MASK);
+        IP4_ADDR(&(cfg->ap_ip_info.netmask), 255, 255, 255, 0);
+    }
+
+    if(!(ip4addr_aton(CONFIG_WMNGR_AP_GW, &(cfg->ap_ip_info.gw)))){
+        ESP_LOGE(TAG, "[%s] Invalid default AP GW: %s. "
+                      "Using 192.168.4.1 instead.",
+                      __FUNCTION__, CONFIG_WMNGR_AP_GW);
+        IP4_ADDR(&(cfg->ap_ip_info.gw), 192, 168, 4, 1);
+    }
+
+    len = strlen(CONFIG_WMNGR_AP_SSID);
+    if(len > 0 && len <= sizeof(cfg->ap.ap.ssid)){
+        memmove(cfg->ap.ap.ssid, CONFIG_WMNGR_AP_SSID, len);
+        cfg->ap.ap.ssid_len = len;
+    } else {
+        ESP_LOGE(TAG, "[%s] Invalid default AP SSID: %s. "
+                      "Using \"ESP WiFi Manager\" instead.",
+                      __FUNCTION__, CONFIG_WMNGR_AP_SSID);
+    }
+
+
+//err_out:
+    return result;
+}
 
 /* Initialise data structures. Needs to be called before any other function, *\
 \* including the system event handler.                                       */
 esp_err_t esp_wmngr_init(void)
 {
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t result;
 
     configASSERT(wifi_events == NULL);
-    configASSERT(data_lock == NULL);
     configASSERT(cfg_state.lock == NULL);
-    configASSERT(scan_timer == NULL);
     configASSERT(config_timer == NULL);
-
     result = ESP_OK;
     memset(&cfg_state, 0x0, sizeof(cfg_state));
     cfg_state.state = cfg_state_idle;
@@ -132,13 +185,6 @@ esp_err_t esp_wmngr_init(void)
         goto err_out;
     }
 
-    data_lock = xSemaphoreCreateMutex();
-    if(data_lock == NULL){
-        ESP_LOGE(TAG, "Unable to create scan data lock.");
-        result = ESP_ERR_NO_MEM;
-        goto err_out;
-    }
-
     cfg_state.lock = xSemaphoreCreateMutex();
     if(cfg_state.lock == NULL){
         ESP_LOGE(TAG, "Unable to create state lock.");
@@ -146,23 +192,32 @@ esp_err_t esp_wmngr_init(void)
         goto err_out;
     }
 
-    scan_timer = xTimerCreate("Scan_Timer",
-                              SCAN_TIMEOUT,
-                              pdFALSE, NULL, handle_scan_timer);
-    if(scan_timer == NULL){
-        ESP_LOGE(TAG, "[%s] Failed to create scan timeout timer",
+#if !defined(CONFIG_WMNGR_TASK)
+    config_timer = xTimerCreate("WMngr_Timer",
+                              CFG_TICKS,
+                              pdFALSE, NULL, handle_timer);
+#else
+    config_timer = xTimerCreate("WMngr_Timer",
+                              CFG_TICKS,
+                              pdTRUE, NULL, handle_timer);
+#endif
+
+    if(config_timer == NULL){
+        ESP_LOGE(TAG, "[%s] Failed to create config validation timer",
                  __FUNCTION__);
         result = ESP_ERR_NO_MEM;
         goto err_out;
     }
 
-    config_timer = xTimerCreate("Config_Timer",
-                              CFG_TICKS,
-                              pdFALSE, NULL, handle_config_timer);
-    if(config_timer == NULL){
-        ESP_LOGE(TAG, "[%s] Failed to create config validation timer",
-                 __FUNCTION__);
-        result = ESP_ERR_NO_MEM;
+    result = esp_wifi_init(&cfg);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] esp_wifi_init() failed", __func__);
+        goto err_out;
+    }
+
+    result = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] esp_wifi_set_storage() failed", __func__);
         goto err_out;
     }
 
@@ -173,19 +228,9 @@ err_out:
             wifi_events = NULL;
         }
 
-        if(data_lock != NULL){
-            vSemaphoreDelete(data_lock);
-            data_lock = NULL;
-        }
-
         if(cfg_state.lock != NULL){
             vSemaphoreDelete(cfg_state.lock);
             cfg_state.lock = NULL;
-        }
-
-        if(scan_timer != NULL){
-            xTimerDelete(scan_timer, 0);
-            scan_timer = NULL;
         }
 
         if(config_timer != NULL){
@@ -203,17 +248,17 @@ struct scan_data *esp_wmngr_get_scan(void)
 {
     struct scan_data *data;
 
-    configASSERT(data_lock != NULL);
+    configASSERT(cfg_state.lock != NULL);
 
     data = NULL;
-    if(data_lock == NULL || last_scan == NULL){
+    if(cfg_state.lock == NULL || cfg_state.scan_ref == NULL){
         goto err_out;
     }
 
-    if(xSemaphoreTake(data_lock, CFG_DELAY) == pdTRUE){
-        data = &(last_scan->data);
-        kref_get(&(last_scan->ref_cnt));
-        xSemaphoreGive(data_lock);
+    if(xSemaphoreTake(cfg_state.lock, CFG_DELAY) == pdTRUE){
+        data = &(cfg_state.scan_ref->data);
+        kref_get(&(cfg_state.scan_ref->ref_cnt));
+        xSemaphoreGive(cfg_state.lock);
     }
 
 err_out:
@@ -242,7 +287,7 @@ void esp_wmngr_put_scan(struct scan_data *data)
 }
 
 /* Fetch the latest AP scan data and make it available. */
-static void wifi_scan_done(system_event_t *event)
+static void wifi_scan_done(void)
 {
     uint16_t num_aps;
     struct scan_data_ref *old, *new;
@@ -252,25 +297,7 @@ static void wifi_scan_done(system_event_t *event)
     new = NULL;
 
     /* cgiWifiSetup() must have been called prior to this point. */
-    configASSERT(data_lock != NULL);
-
-    /* Receiving anything other than scan done means something is *\
-    \* really messed up.                                          */
-    configASSERT(event->event_id == SYSTEM_EVENT_SCAN_DONE);
-
-    if(atomic_load(&scan_in_progress) == false){
-        /* Either scan was cancelled due to timeout or somebody else *\
-        \* is triggering scans.                                      */
-        ESP_LOGE(TAG, "[%s] Received unsolicited scan done event.",
-                 __FUNCTION__);
-        return;
-    }
-
-    if(event->event_info.scan_done.status != ESP_OK){
-        ESP_LOGI(TAG, "Scan failed. Event status: 0x%x",
-                 event->event_info.scan_done.status);
-        goto err_out;
-    }
+    configASSERT(cfg_state.lock != NULL);
 
     /* Fetch number of APs found. Bail out early if there is nothing to get. */
     result = esp_wifi_scan_get_ap_num(&num_aps);
@@ -313,13 +340,13 @@ static void wifi_scan_done(system_event_t *event)
     ESP_LOGI(TAG, "Scan done: found %d APs", num_aps);
 
     /* Make new scan data available. */
-    if(xSemaphoreTake(data_lock, portTICK_PERIOD_MS) == pdTRUE){
+    if(xSemaphoreTake(cfg_state.lock, portTICK_PERIOD_MS) == pdTRUE){
         /* The new data set will be assigned to the global pointer, so fetch *\
         \* another reference.                                                */
         kref_get(&(new->ref_cnt));
 
-        old = last_scan;
-        last_scan = new;
+        old = cfg_state.scan_ref;
+        cfg_state.scan_ref = new;
 
         if(old != NULL){
             /* Drop global reference to old data set so it will be freed    *\
@@ -327,7 +354,7 @@ static void wifi_scan_done(system_event_t *event)
             esp_wmngr_put_scan(&(old->data));
         }
 
-        xSemaphoreGive(data_lock);
+        xSemaphoreGive(cfg_state.lock);
     }
 
 err_out:
@@ -336,29 +363,14 @@ err_out:
         esp_wmngr_put_scan(&(new->data));
     }
 
-    /* Clear scan flag so a new scan can be triggered. */
-    atomic_store(&scan_in_progress, false);
-    if(scan_timer != NULL){
-        xTimerStop(scan_timer, 0);
-    }
-}
-
-/* Timer function to stop a hanging AP scan. */
-static void handle_scan_timer(TimerHandle_t timer)
-{
-    atomic_bool tmp = ATOMIC_VAR_INIT(true);
-
-    if(atomic_compare_exchange_strong(&scan_in_progress, &tmp, true) == true){
-        ESP_LOGI(TAG, "[%s] Timeout, stopping scan.", __FUNCTION__);
-        (void) esp_wifi_scan_stop();
-        atomic_store(&scan_in_progress, false);
-    }
+    xEventGroupClearBits(wifi_events, BIT_SCAN_DONE);
 }
 
 /* Function to trigger an AP scan. */
 void esp_wmngr_start_scan(void)
 {
     wifi_scan_config_t scan_cfg;
+    EventBits_t events;
     wifi_mode_t mode;
     esp_err_t result;
 
@@ -387,24 +399,26 @@ void esp_wmngr_start_scan(void)
         goto err_out;
     }
 
+    events = xEventGroupGetBits(wifi_events);
+
+        xEventGroupClearBits(wifi_events, BIT_SCAN_START);
+            xEventGroupSetBits(wifi_events, BIT_SCAN_DONE);
+
     /* Finally, start a scan. Unless there is one running already. */
-    if(atomic_exchange(&scan_in_progress, true) == false){
+    if(!(events & (BIT_SCAN_START | BIT_SCAN_DONE))){
         ESP_LOGI(TAG, "[%s] Starting scan.", __FUNCTION__);
 
         memset(&scan_cfg, 0x0, sizeof(scan_cfg));
         scan_cfg.show_hidden = true;
         scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
 
+        xEventGroupSetBits(wifi_events, BIT_SCAN_START);
         result = esp_wifi_scan_start(&scan_cfg, false);
         if(result == ESP_OK){
-            ESP_LOGI(TAG, "[%s] Starting timer.", __FUNCTION__);
-
-            /* Trigger the timer so scan will be aborted after timeout. */
-            xTimerReset(scan_timer, 0);
+            ESP_LOGI(TAG, "[%s] Scan started.", __FUNCTION__);
+            xEventGroupClearBits(wifi_events, BIT_SCAN_START | BIT_SCAN_DONE);
         } else {
             ESP_LOGE(TAG, "[%s] Starting AP scan failed.", __FUNCTION__);
-
-            atomic_store(&scan_in_progress, false);
         }
     } else {
         ESP_LOGI(TAG, "[%s] Scan aleady running.", __FUNCTION__);
@@ -415,6 +429,62 @@ err_out:
     return;
 }
 
+static esp_err_t get_saved_config(struct wifi_cfg *cfg)
+{
+    nvs_handle handle;
+    size_t len;
+    esp_err_t result;
+
+    result = ESP_OK;
+
+    memset(cfg, 0x0, sizeof(*cfg));
+
+    result = nvs_open(WMNGR_NAMESPACE, NVS_READONLY, &handle);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] nvs_open() failed.", __FUNCTION__);
+        return result;
+    }
+
+    len = sizeof(*cfg);
+    result = nvs_get_blob(handle, "config", cfg, &len);
+    if(result != ESP_OK || len != sizeof(*cfg)){
+        ESP_LOGE(TAG, "[%s] Reading config failed.", __FUNCTION__);
+        goto err_out;
+    }
+
+err_out:
+    nvs_close(handle);
+    return result;
+}
+
+static esp_err_t save_config(struct wifi_cfg *cfg)
+{
+    nvs_handle handle;
+    size_t len;
+    esp_err_t result;
+
+    result = ESP_OK;
+
+    result = nvs_open(WMNGR_NAMESPACE, NVS_READWRITE, &handle);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] nvs_open() failed.", __FUNCTION__);
+        return result;
+    }
+
+    len = sizeof(*cfg);
+    result = nvs_set_blob(handle, "config", cfg, len);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] Reading config failed.", __FUNCTION__);
+        goto err_out;
+    }
+
+   result = nvs_commit(handle);
+
+err_out:
+    nvs_close(handle);
+    return result;
+}
+
 /* Helper function to check if WiFi is connected in station mode. */
 static bool sta_connected(void)
 {
@@ -422,12 +492,13 @@ static bool sta_connected(void)
 
     events = xEventGroupGetBits(wifi_events);
 
-    return !!(events & BIT_CONNECTED);
+    return !!(events & BIT_STA_CONNECTED);
 }
 
 /* Helper function to set WiFi configuration from struct wifi_cfg. */
-static void set_wifi_cfg(struct wifi_cfg *cfg)
+static esp_err_t set_wifi_cfg(struct wifi_cfg *cfg)
 {
+    unsigned int idx;
     esp_err_t result;
 
     /* FIXME: we should check for errors. OTOH, this is also used  *\
@@ -459,6 +530,22 @@ static void set_wifi_cfg(struct wifi_cfg *cfg)
             ESP_LOGE(TAG, "[%s] esp_wifi_set_config() STA: %d %s",
                      __FUNCTION__, result, esp_err_to_name(result));
         }
+        if(cfg->sta_static){
+            for(idx = 0; idx < ARRAY_SIZE(cfg->sta_dns_info); ++idx){
+                if(ip_addr_isany_val(cfg->sta_dns_info[idx].ip)){
+                    continue;
+                }
+
+                result = tcpip_adapter_set_dns_info(TCPIP_ADAPTER_IF_STA,
+                                                    idx,
+                                                    &(cfg->sta_dns_info[idx]));
+                if(result != ESP_OK){
+                    ESP_LOGE(TAG, "[%s] Setting DNS server IP failed.", 
+                            __FUNCTION__);
+                    goto err_out;
+                }
+            }
+        }
     }
 
     result = esp_wifi_start();
@@ -467,7 +554,7 @@ static void set_wifi_cfg(struct wifi_cfg *cfg)
                  __FUNCTION__, result, esp_err_to_name(result));
     }
 
-    if(cfg->connect
+    if(cfg->sta_connect
        && (   cfg->mode == WIFI_MODE_STA
            || cfg->mode == WIFI_MODE_APSTA))
     {
@@ -477,29 +564,21 @@ static void set_wifi_cfg(struct wifi_cfg *cfg)
                      __FUNCTION__, result, esp_err_to_name(result));
         }
     }
+
+err_out:
+    return result;
 }
 
 /* Helper to store current WiFi configuration into a struct wifi_cfg. */
 static esp_err_t get_wifi_cfg(struct wifi_cfg *cfg)
 {
+    unsigned int idx;
     esp_err_t result;
 
     result = ESP_OK;
-    memset(cfg, 0x0, sizeof(*cfg));
-
-    cfg->connect = sta_connected();
-
-    result = esp_wifi_get_config(WIFI_IF_STA, &(cfg->sta));
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] Error fetching STA config.", __FUNCTION__);
-        goto err_out;
-    }
-
-    result = esp_wifi_get_config(WIFI_IF_AP, &(cfg->ap));
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] Error fetching AP config.", __FUNCTION__);
-        goto err_out;
-    }
+    memmove(cfg, &cfg_state.current, sizeof(*cfg));
+#if 0
+    cfg->sta_connect = sta_connected();
 
     result = esp_wifi_get_mode(&(cfg->mode));
     if(result != ESP_OK){
@@ -507,7 +586,35 @@ static esp_err_t get_wifi_cfg(struct wifi_cfg *cfg)
         goto err_out;
     }
 
+    result = esp_wifi_get_config(WIFI_IF_STA, &(cfg->sta));
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] Error fetching STA config.", __FUNCTION__);
+        goto err_out;
+    }
+        if(cfg->sta_static){
+            for(idx = 0; idx < ARRAY_SIZE(cfg->sta_dns_info); ++idx){
+                if(ip_addr_isany_val(cfg->sta_dns_info[idx].ip)){
+                    continue;
+                }
+
+                result = tcpip_adapter_set_dns_info(TCPIP_ADAPTER_IF_STA,
+                                                    idx,
+                                                    &(cfg->sta_dns_info[idx]));
+                if(result != ESP_OK){
+                    ESP_LOGE(TAG, "[%s] Setting DNS server IP failed.", 
+                            __FUNCTION__);
+                    goto err_out;
+                }
+            }
+        }
+
+    result = esp_wifi_get_config(WIFI_IF_AP, &(cfg->ap));
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] Error fetching AP config.", __FUNCTION__);
+        goto err_out;
+    }
 err_out:
+#endif
     return result;
 }
 
@@ -531,7 +638,7 @@ err_out:
  * To connect to an AP with WPS, save the current state, set .state          *
  * to cfg_state_wps_start and start the config_timer.                        *
  \*                                                                          */
-static void handle_config_timer(TimerHandle_t timer)
+static void handle_wifi(TimerHandle_t timer)
 {
     bool connected;
     wifi_mode_t mode;
@@ -577,7 +684,7 @@ static void handle_config_timer(TimerHandle_t timer)
         get_wifi_cfg(&cfg_state.new);
         memset(&cfg_state.new.sta, 0x0, sizeof(cfg_state.new.sta));
         cfg_state.new.mode = WIFI_MODE_APSTA;
-        cfg_state.new.connect = false;
+        cfg_state.new.sta_connect = false;
 
         set_wifi_cfg(&cfg_state.new);
 
@@ -600,7 +707,7 @@ static void handle_config_timer(TimerHandle_t timer)
         }
 
         /* WPS is running, set time stamp and transition to next state. */
-        cfg_state.timestamp = now;
+        cfg_state.cfg_timestamp = now;
         cfg_state.state = cfg_state_wps_active;
         delay = CFG_TICKS;
         break;
@@ -620,10 +727,10 @@ static void handle_config_timer(TimerHandle_t timer)
             \* connect flag and trigger update.                     */
             get_wifi_cfg(&cfg_state.new);
             cfg_state.new.mode = WIFI_MODE_APSTA;
-            cfg_state.new.connect = true;
+            cfg_state.new.sta_connect = true;
             cfg_state.state = cfg_state_update;
             delay = CFG_DELAY;
-        } else if(   time_after(now, (cfg_state.timestamp + CFG_TIMEOUT))
+        } else if(   time_after(now, (cfg_state.cfg_timestamp + CFG_TIMEOUT))
                   || (events & BIT_WPS_FAILED))
         {
             /* Failure or timeout. Trigger fall-back to the previous config. */
@@ -648,12 +755,12 @@ static void handle_config_timer(TimerHandle_t timer)
         (void) esp_wifi_disconnect();
         set_wifi_cfg(&(cfg_state.new));
 
-        if(cfg_state.new.mode == WIFI_MODE_AP || !cfg_state.new.connect){
+        if(cfg_state.new.mode == WIFI_MODE_AP || !cfg_state.new.sta_connect){
             /* AP-only mode or not connecting, we are done. */
             cfg_state.state = cfg_state_idle;
         } else {
             /* System should now connect to the AP. */
-            cfg_state.timestamp = now;
+            cfg_state.cfg_timestamp = now;
             cfg_state.state = cfg_state_connecting;
             delay = CFG_TICKS;
         }
@@ -663,7 +770,7 @@ static void handle_config_timer(TimerHandle_t timer)
         if(connected){
             /* We have a connection! \o/ */
             cfg_state.state = cfg_state_connected;
-        } else if(time_after(now, (cfg_state.timestamp + CFG_TIMEOUT))){
+        } else if(time_after(now, (cfg_state.cfg_timestamp + CFG_TIMEOUT))){
             /* Timeout while waiting for connection. Try falling back to the *\
             \* saved configuration.                                          */
             cfg_state.state = cfg_state_fallback;
@@ -688,12 +795,14 @@ static void handle_config_timer(TimerHandle_t timer)
     }
 
 err_out:
+#if !defined(CONFIG_WMNGR_TASK)
     if(delay > 0){
         /* We are in a transitional state, re-arm the timer. */
         if(xTimerChangePeriod(config_timer, delay, CFG_DELAY) != pdPASS){
             cfg_state.state = cfg_state_failed;
         }
     }
+#endif
 
     ESP_LOGD(TAG, "[%s] Leaving. State: %s delay: %d",
              __FUNCTION__, state_names[cfg_state.state], delay);
@@ -702,6 +811,14 @@ err_out:
     return;
 }
 
+static void handle_timer(TimerHandle_t timer)
+{
+#if defined(CONFIG_WMNGR_TASK)
+    xEventGroupSetBits(wifi_events, BIT_TRIGGER);
+#else
+    handle_wifi(timer);
+#endif
+}
 static const char *event_names[] = {
         "WIFI_READY",
         "SCAN_DONE",
@@ -735,19 +852,43 @@ static const char *event_names[] = {
 \* the current system state.                                            */
 esp_err_t esp_wmngr_event_handler(void *ctx, system_event_t *event)
 {
+    EventBits_t old, new;
+
     ESP_LOGD(TAG, "[%s] Received %s.",
             __FUNCTION__, event_names[event->event_id]);
 
+    old = xEventGroupGetBits(wifi_events);
+
     switch(event->event_id){
     case SYSTEM_EVENT_SCAN_DONE:
-        wifi_scan_done(event);
+        if(event->event_info.scan_done.status == ESP_OK){
+            xEventGroupSetBits(wifi_events, BIT_SCAN_DONE);
+        }
+        xEventGroupClearBits(wifi_events, BIT_SCAN_START);
         break;
     case SYSTEM_EVENT_STA_GOT_IP:
-    case SYSTEM_EVENT_GOT_IP6:
-        xEventGroupSetBits(wifi_events, BIT_CONNECTED);
+        xEventGroupSetBits(wifi_events, BIT_STA_GOT_IP);
+        break;
+    case SYSTEM_EVENT_STA_LOST_IP:
+        xEventGroupClearBits(wifi_events, BIT_STA_GOT_IP);
+        break;
+    case SYSTEM_EVENT_STA_START:
+        xEventGroupSetBits(wifi_events, BIT_STA_START);
+        break;
+    case SYSTEM_EVENT_STA_STOP:
+        xEventGroupClearBits(wifi_events, BIT_STA_START);
+        break;
+    case SYSTEM_EVENT_STA_CONNECTED:
+        xEventGroupSetBits(wifi_events, BIT_STA_CONNECTED);
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
-        xEventGroupClearBits(wifi_events, BIT_CONNECTED);
+        xEventGroupClearBits(wifi_events, BIT_STA_CONNECTED);
+        break;
+    case SYSTEM_EVENT_AP_START:
+        xEventGroupSetBits(wifi_events, BIT_AP_START);
+        break;
+    case SYSTEM_EVENT_AP_STOP:
+        xEventGroupClearBits(wifi_events, BIT_AP_START);
         break;
     case SYSTEM_EVENT_STA_WPS_ER_SUCCESS:
         xEventGroupSetBits(wifi_events, BIT_WPS_SUCCESS);
@@ -759,6 +900,12 @@ esp_err_t esp_wmngr_event_handler(void *ctx, system_event_t *event)
         break;
     default:
         break;
+    }
+
+    new = xEventGroupGetBits(wifi_events);
+
+    if(old != new){
+        xEventGroupSetBits(wifi_events, BIT_TRIGGER);
     }
 
     return ESP_OK;
@@ -879,3 +1026,20 @@ err_out:
     xSemaphoreGive(cfg_state.lock);
     return result;
 }
+
+#if defined(CONFIG_WMNGR_TASK)
+void esp_wmngr_task(void *pvParameters)
+{
+    EventBits_t events;
+
+    do{
+        /* Wait for and clear timer bit */
+        events = xEventGroupWaitBits(wifi_events, BIT_TRIGGER,
+                                     true, false, portMAX_DELAY);
+
+        xEventGroupClearBits(wifi_events, BIT_TRIGGER);
+
+        handle_wifi(config_timer);
+    } while(1);
+}
+#endif // defined(CONFIG_WMNGR_TASK)
