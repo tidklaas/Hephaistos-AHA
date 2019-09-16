@@ -18,8 +18,6 @@
  * MA  02110-1301, USA.
  */
 
-#define _GNU_SOURCE
-
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -766,10 +764,62 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
         goto err_out;
     }
 
-    result = parse_data_ul(node, "batterylow", &(entry->hkr.batt_low));
-    if(result != 0){
-        ESP_LOGE(TAG, "Error parsing battery status for entry %s", entry->name);
-        goto err_out;
+    if(dom_find_node(node, "battery")){
+        result = parse_data_ul(node, "battery", &(entry->hkr.batt_level));
+        if(result != 0){
+            ESP_LOGE(TAG, "Error parsing battery level for entry %s",
+                       entry->name);
+            goto err_out;
+        }
+    } else {
+        entry->hkr.batt_level = 100;
+    }
+
+    if(dom_find_node(node, "batterylow")){
+        result = parse_data_ul(node, "batterylow", &(entry->hkr.batt_low));
+        if(result != 0){
+            ESP_LOGE(TAG, "Error parsing battery status for entry %s",
+                       entry->name);
+            goto err_out;
+        }
+    } else {
+        entry->hkr.batt_low = 0;
+    }
+
+    if(dom_find_node(node, "summeractive")){
+        result = parse_data_ul(node, "summeractive",
+                               &(entry->hkr.summer_act));
+        if(result != 0){
+            ESP_LOGE(TAG, "Error parsing summer status for entry %s",
+                       entry->name);
+            goto err_out;
+        }
+    } else {
+        entry->hkr.summer_act = 0;
+    }
+
+    if(dom_find_node(node, "holidayactive")){
+        result = parse_data_ul(node, "holidayactive",
+                               &(entry->hkr.holiday_act));
+        if(result != 0){
+            ESP_LOGE(TAG, "Error parsing holiday status for entry %s",
+                       entry->name);
+            goto err_out;
+        }
+    } else {
+        entry->hkr.holiday_act = 0;
+    }
+
+    if(dom_find_node(node, "windowopenactiv")){
+        result = parse_data_ul(node, "windowopenactiv",
+                               &(entry->hkr.window_open));
+        if(result != 0){
+            ESP_LOGE(TAG, "Error parsing holiday status for entry %s",
+                       entry->name);
+            goto err_out;
+        }
+    } else {
+        entry->hkr.window_open = 0;
     }
 
     result = parse_data_ul(node, "endperiod", &(entry->hkr.next_change));
@@ -1117,7 +1167,8 @@ static void dump_hkr(struct aha_hkr *hkr, const char *prefix)
     if(hkr->present){
         ESP_LOGD(TAG,
                  "%s[HKR] Set: %lu Act: %lu Comf: %lu Eco: %lu Next: %lu "
-                 "Change: %lu: Batt: %lu Lock: %s DevLock: %s Err: %lu",
+                 "Change: %lu: Batt: %lu BattLow: %lu Win: %lu Holiday: %lu "
+                 "Summer: %lu Lock: %s DevLock: %s Err: %lu",
                  prefix,
                  hkr->set_temp,
                  hkr->act_temp,
@@ -1125,7 +1176,11 @@ static void dump_hkr(struct aha_hkr *hkr, const char *prefix)
                  hkr->eco_temp,
                  hkr->next_temp,
                  hkr->next_change,
+                 hkr->batt_level,
                  hkr->batt_low,
+                 hkr->window_open,
+                 hkr->holiday_act,
+                 hkr->summer_act,
                  hkr->lock == aha_lock_on ? "on" : "off",
                  hkr->device_lock == aha_lock_on ? "on" : "off",
                  hkr->error);

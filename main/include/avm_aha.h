@@ -91,10 +91,13 @@ struct aha_hkr
     unsigned long act_temp;
     unsigned long comfort_temp;
     unsigned long eco_temp;
+    unsigned long batt_level;
     unsigned long batt_low;
     unsigned long window_open;
     unsigned long next_temp;
     unsigned long next_change;
+    unsigned long holiday_act;
+    unsigned long summer_act;
     enum aha_lock_mode lock;
     enum aha_lock_mode device_lock;
     unsigned long error;
