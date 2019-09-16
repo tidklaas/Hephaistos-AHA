@@ -120,7 +120,7 @@ static struct aha_data *create_data(void)
     INIT_KLIST_HEAD(&(data->grp_head));
 
     ++data_created;
-    ESP_LOGI(TAG, "Data created: %d released: %d", data_created, data_released);
+    ESP_LOGD(TAG, "Data created: %d released: %d", data_created, data_released);
 
 err_out:
     return data;
@@ -159,7 +159,7 @@ static void release_data(struct kref *ref_cnt)
     free(data);
 
     ++data_released;
-    ESP_LOGI(TAG, "Data created: %d released: %d", data_created, data_released);
+    ESP_LOGD(TAG, "Data created: %d released: %d", data_created, data_released);
 }
 
 struct auth_data
@@ -1115,7 +1115,7 @@ err_out:
 static void dump_hkr(struct aha_hkr *hkr, const char *prefix)
 {
     if(hkr->present){
-        ESP_LOGI(TAG,
+        ESP_LOGD(TAG,
                  "%s[HKR] Set: %lu Act: %lu Comf: %lu Eco: %lu Next: %lu "
                  "Change: %lu: Batt: %lu Lock: %s DevLock: %s Err: %lu",
                  prefix,
@@ -1135,7 +1135,7 @@ static void dump_hkr(struct aha_hkr *hkr, const char *prefix)
 static void dump_swi(struct aha_switch *swi, const char *prefix)
 {
     if(swi->present){
-        ESP_LOGI(TAG, "%s[SWI] State: %s Mode: %s Lock: %s DevLock: %s",
+        ESP_LOGD(TAG, "%s[SWI] State: %s Mode: %s Lock: %s DevLock: %s",
                  prefix,
                  swi->state == aha_swstate_on ? "on" : "off",
                  swi->mode == aha_switch_auto ? "auto" : "manual",
@@ -1147,7 +1147,7 @@ static void dump_swi(struct aha_switch *swi, const char *prefix)
 static void dump_temp(struct aha_thermo *tmp, const char *prefix)
 {
     if(tmp->present){
-        ESP_LOGI(TAG, "%s[TMP] Temperature: %ld Offset: %ld",
+        ESP_LOGD(TAG, "%s[TMP] Temperature: %ld Offset: %ld",
                  prefix,
                  tmp->temp_c,
                  tmp->offset);
@@ -1157,7 +1157,7 @@ static void dump_temp(struct aha_thermo *tmp, const char *prefix)
 static void dump_pwr(struct aha_power *pwr, const char *prefix)
 {
     if(pwr->present){
-        ESP_LOGI(TAG, "%s[PWR] Power: %lu Energy: %lu",
+        ESP_LOGD(TAG, "%s[PWR] Power: %lu Energy: %lu",
                  prefix,
                  pwr->power,
                  pwr->energy);
@@ -1166,7 +1166,7 @@ static void dump_pwr(struct aha_power *pwr, const char *prefix)
 
 static void dump_device(struct aha_device *dev, const char *prefix)
 {
-    ESP_LOGI(TAG, "%s[%s] Name: %s ID: %lu Present: %lu Ident: %s FW: %s "
+    ESP_LOGD(TAG, "%s[%s] Name: %s ID: %lu Present: %lu Ident: %s FW: %s "
                   "Manuf: %s ProdName: %s Funcs: 0x%lx",
              prefix,
              dev->type == aha_type_device ? "DEV" : "GRP",
@@ -1246,7 +1246,7 @@ static int check_auth(struct auth_data *auth)
 
     node = dom_find_node(dom, "SID");
     if(node && strncmp(node->data, INVALID_SID, node->data_len)){
-        ESP_LOGI(TAG, "SID %s still valid", auth->sid);
+        ESP_LOGD(TAG, "SID %s still valid", auth->sid);
         goto err_out;
     }
 
@@ -1293,7 +1293,7 @@ static int check_auth(struct auth_data *auth)
         goto err_out;
     }
 
-    ESP_LOGI(TAG, "New SID: %s", auth->sid);
+    ESP_LOGD(TAG, "New SID: %s", auth->sid);
 
 err_out:
     if(req != NULL){
@@ -1426,7 +1426,7 @@ static enum aha_heat_mode need_heat(struct aha_data *data)
     klist_for_each_entry(device, &(data->dev_head), dev_list){
         tmp = dev_need_heat(device);
         if(tmp >= aha_heat_on){
-            ESP_LOGI(TAG,"%s", device->name);
+            ESP_LOGD(TAG,"%s", device->name);
             result = tmp;
         }
     }
@@ -1437,7 +1437,7 @@ err_out:
 
 static void fire(bool on)
 {
-    ESP_LOGI(TAG, "Fire %s!", on ? "on" : "off");
+    ESP_LOGD(TAG, "Fire %s!", on ? "on" : "off");
     heph_heat_set(on);
 }
 
@@ -1713,7 +1713,7 @@ void avm_aha_task(void *pvParameters)
                         sizeof(auth_data.pass));
 
             } else {
-                ESP_LOGI(TAG, "Config reload failed");
+                ESP_LOGW(TAG, "Config reload failed");
 
                 /* Make sure we try again */
                 xEventGroupSetBits(aha_event_group, BIT_RELOAD);
@@ -1735,18 +1735,18 @@ void avm_aha_task(void *pvParameters)
             continue;
         }
 
-        ESP_LOGI(TAG, "Free heap before fetch: 0x%x", esp_get_free_heap_size());
+        ESP_LOGD(TAG, "Free heap before fetch: 0x%x", esp_get_free_heap_size());
         dom = fetch_data(&auth_data);
-        ESP_LOGI(TAG, "Free heap after fetch: 0x%x", esp_get_free_heap_size());
+        ESP_LOGD(TAG, "Free heap after fetch: 0x%x", esp_get_free_heap_size());
         if(dom == NULL){
-            ESP_LOGI(TAG, "Fetching data failed");
+            ESP_LOGW(TAG, "Fetching data failed");
             continue;
         }
 
-        ESP_LOGI(TAG, "Free heap before parse: 0x%x", esp_get_free_heap_size());
+        ESP_LOGD(TAG, "Free heap before parse: 0x%x", esp_get_free_heap_size());
         new_data = parse_dom(dom);
         dom_free(dom);
-        ESP_LOGI(TAG, "Free heap after parse: 0x%x", esp_get_free_heap_size());
+        ESP_LOGD(TAG, "Free heap after parse: 0x%x", esp_get_free_heap_size());
         if(new_data == NULL){
             ESP_LOGE(TAG, "Parsing data failed");
             continue;
@@ -1770,7 +1770,7 @@ void avm_aha_task(void *pvParameters)
 
         heph_led_set(false);
 
-        ESP_LOGI(TAG, "Free heap before data update: 0x%x", esp_get_free_heap_size());
+        ESP_LOGD(TAG, "Free heap before data update: 0x%x", esp_get_free_heap_size());
 
         /* Try to update public aha state data */
         if(xSemaphoreTake(aha_data_lock, 100 * portTICK_PERIOD_MS) == pdTRUE){
@@ -1781,11 +1781,11 @@ void avm_aha_task(void *pvParameters)
             }
             xSemaphoreGive(aha_data_lock);
         } else {
-            ESP_LOGI(TAG, "Unable to get aha_data_lock for update.");
+            ESP_LOGW(TAG, "Unable to get aha_data_lock for update.");
             aha_data_release(new_data);
         }
 
-        ESP_LOGI(TAG, "Free heap after data update: 0x%x", esp_get_free_heap_size());
+        ESP_LOGD(TAG, "Free heap after data update: 0x%x", esp_get_free_heap_size());
 
         result = esp_task_wdt_reset();
         if(result != 0){
