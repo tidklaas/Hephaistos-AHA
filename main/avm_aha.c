@@ -58,6 +58,7 @@
 #include "mbedtls/certs.h"
 #include "mbedtls/md5.h"
 
+#include <wifi_manager.h>
 #include <expat.h>
 #include <expat-dom.h>
 #include <klist.h>
@@ -1481,7 +1482,7 @@ static enum aha_heat_mode need_heat(struct aha_data *data)
     klist_for_each_entry(device, &(data->dev_head), dev_list){
         tmp = dev_need_heat(device);
         if(tmp >= aha_heat_on){
-            ESP_LOGD(TAG,"%s", device->name);
+            ESP_LOGI(TAG,"Needs Heat: %s", device->name);
             result = tmp;
         }
     }
@@ -1492,7 +1493,7 @@ err_out:
 
 static void fire(bool on)
 {
-    ESP_LOGD(TAG, "Fire %s!", on ? "on" : "off");
+    ESP_LOGI(TAG, "Fire %s!", on ? "on" : "off");
     heph_heat_set(on);
 }
 
@@ -1777,8 +1778,7 @@ void avm_aha_task(void *pvParameters)
         }
 
         /* Skip data retrieval if we have connectivity or network issues */
-        result = heph_connected();
-        if(result != ESP_OK){
+        if(!esp_wmngr_is_connected()){
             continue;
         }
 

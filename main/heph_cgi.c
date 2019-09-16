@@ -15,15 +15,17 @@
 #include <hephaistos.h>
 #include <avm_aha.h>
 #include <http_srv.h>
+#include <wifi_manager.h>
 #include <cJSON.h>
 #include <sys/param.h>
 
 static const char *TAG = "CGI";
 CgiStatus cgi_redirect(HttpdConnData *conn)
 {
-    struct heph_wifi_cfg heph_cfg;
+    struct heph_cfg heph_cfg;
     struct http_srv_cfg http_cfg;
     struct aha_cfg aha_cfg;
+    struct wifi_cfg wifi_cfg;
     esp_err_t result;
 
     if (conn->isConnectionClosed) {
@@ -43,9 +45,7 @@ CgiStatus cgi_redirect(HttpdConnData *conn)
     }
 
     /* WiFi config */
-    result = heph_get_cfg(&heph_cfg, cfg_nvs);
-    if(result != ESP_OK){
-        // FIXME: handle temporary error
+    if(!esp_wmngr_nvs_valid()){
         httpdRedirect(conn, "/wifi/");
         goto err_out;
     }
@@ -518,6 +518,14 @@ esp_err_t hkr_2_json(struct aha_hkr *hkr, cJSON **obj)
     cJSON_AddItemToObjectCS(json, "eco_temp", tmp);
     *obj = json;
 
+    tmp = cJSON_CreateNumber(hkr->batt_level);
+    if(tmp == NULL){
+        result = ESP_ERR_NO_MEM;
+        goto err_out;
+    }
+    cJSON_AddItemToObjectCS(json, "batt_level", tmp);
+    *obj = json;
+
     tmp = cJSON_CreateNumber(hkr->batt_low);
     if(tmp == NULL){
         result = ESP_ERR_NO_MEM;
@@ -532,6 +540,22 @@ esp_err_t hkr_2_json(struct aha_hkr *hkr, cJSON **obj)
         goto err_out;
     }
     cJSON_AddItemToObjectCS(json, "window_open", tmp);
+    *obj = json;
+
+    tmp = cJSON_CreateNumber(hkr->holiday_act);
+    if(tmp == NULL){
+        result = ESP_ERR_NO_MEM;
+        goto err_out;
+    }
+    cJSON_AddItemToObjectCS(json, "holiday_act", tmp);
+    *obj = json;
+
+    tmp = cJSON_CreateNumber(hkr->summer_act);
+    if(tmp == NULL){
+        result = ESP_ERR_NO_MEM;
+        goto err_out;
+    }
+    cJSON_AddItemToObjectCS(json, "summer_act", tmp);
     *obj = json;
 
     tmp = cJSON_CreateNumber(hkr->next_temp);
@@ -752,19 +776,19 @@ err_out:
 }
 
 struct aha_dump {
-    struct aha_data *data;
     char *str;
     size_t offset;
 };
 
 CgiStatus cgi_aha_dump(HttpdConnData *conn)
 {
-    struct aha_device *dev, *grp;
+    struct aha_data *data;
     cJSON *json;
     struct aha_dump *dumper;
     size_t chunk;
     CgiStatus result;
 
+    data = NULL;
     json = NULL;
     dumper = conn->cgiData;
     result = HTTPD_CGI_MORE;
@@ -794,14 +818,14 @@ CgiStatus cgi_aha_dump(HttpdConnData *conn)
             goto err_out;
         }
 
-        dumper->data = aha_data_get();
-        if(dumper->data == NULL){
+        data = aha_data_get();
+        if(data == NULL){
             ESP_LOGE(TAG, "[%s] No AHA data", __func__);
             result = HTTPD_CGI_DONE;
             goto err_out;
         }
 
-        json = aha_2_json(dumper->data);
+        json = aha_2_json(data);
         if(json == NULL){
             ESP_LOGE(TAG, "[%s] Creating JSON failed.", __func__);
             result = HTTPD_CGI_DONE;
@@ -834,11 +858,12 @@ err_out:
         cJSON_Delete(json);
     }
 
+    if(data != NULL){
+        aha_data_release(data);
+    }
+
     if(result == HTTPD_CGI_DONE && dumper != NULL){
         ESP_LOGD(TAG, "[%s] Cleaning up", __func__);
-        if(dumper->data != NULL){
-            aha_data_release(dumper->data);
-        }
 
         if(dumper->str != NULL){
             free(dumper->str);

@@ -1,6 +1,6 @@
 /*
  * This file is part of the Hephaistos-AHA project.
- * Copyright (C) 2018  Tido Klaassen <tido_hephaistos@4gh.eu>
+ * Copyright (C) 2018-2019 Tido Klaassen <tido_hephaistos@4gh.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -46,7 +46,7 @@
 #include <driver/gpio.h>
 #include <driver/ledc.h>
 #include <esp_intr_alloc.h>
-#include <rom/rtc.h>
+#include <esp32/rom/rtc.h>
 #include <esp_ota_ops.h>
 #include <esp_image_format.h>
 
@@ -58,6 +58,7 @@
 
 #include <lwip/apps/sntp.h>
 
+#include <wifi_manager.h>
 #include <libesphttpd/cgiwifi.h>
 #include <http_srv.h>
 
@@ -70,8 +71,8 @@
 #define TASK_RESET_PERIOD_S     5
 #define FW_RESET_TIME           10
 
-static struct heph_wifi_cfg wifi_cfg;
-static SemaphoreHandle_t wifi_cfg_lock = NULL;
+static struct heph_cfg heph_cfg;
+static SemaphoreHandle_t cfg_lock = NULL;
 
 static EventGroupHandle_t heph_event_group;
 static TimerHandle_t heph_timer = NULL;
@@ -86,268 +87,42 @@ __NOINIT_ATTR static volatile struct _restart_marker {
 
 static const char *TAG = "hephaistos";
 
-static struct heph_state {
-    wifi_config_t ap_cfg;
-    wifi_config_t st_cfg;
-    wifi_mode_t mode;
-} heph_state;
-
 static const int BIT_TRIGGER       = BIT0;
-static const int BIT_STA_STARTED   = BIT1;
-static const int BIT_STA_CONNECTED = BIT2;
-static const int BIT_AP_STARTED    = BIT3;
-static const int BIT_AP_CONNECTED  = BIT4;
-static const int BIT_RELOAD_CFG    = BIT5;
-static const int BIT_NTP_SYNC      = BIT6;
-static const int BIT_AHA_CFG       = BIT7;
-static const int BIT_AHA_RUN       = BIT8;
-static const int BIT_HTTP_RUN      = BIT9;
-static const int BIT_FW_RESET      = BIT10;
-static const int BIT_UPD_WIFICFG   = BIT11;
-
-const char *wifi_reasons[] = {
-    [1] = "UNSPECIFIED",
-    [2] = "AUTH_EXPIRE",
-    [3] = "AUTH_LEAVE",
-    [4] = "ASSOC_EXPIRE",
-    [5] = "ASSOC_TOOMANY",
-    [6] = "NOT_AUTHED",
-    [7] = "NOT_ASSOCED",
-    [8] = "ASSOC_LEAVE",
-    [9] = "ASSOC_NOT_AUTHED",
-    [10] = "DISASSOC_PWRCAP_BAD",
-    [11] = "DISASSOC_SUPCHAN_BAD",
-    [13] = "IE_INVALID",
-    [14] = "MIC_FAILURE",
-    [15] = "4WAY_HANDSHAKE_TIMEOUT",
-    [16] = "GROUP_KEY_UPDATE_TIMEOUT",
-    [17] = "IE_IN_4WAY_DIFFERS",
-    [18] = "GROUP_CIPHER_INVALID",
-    [19] = "PAIRWISE_CIPHER_INVALID",
-    [20] = "AKMP_INVALID",
-    [21] = "UNSUPP_RSN_IE_VERSION",
-    [22] = "INVALID_RSN_IE_CAP",
-    [23] = "802_1X_AUTH_FAILED",
-    [24] = "CIPHER_SUITE_REJECTED",
-    [200] = "BEACON_TIMEOUT",
-    [201] = "NO_AP_FOUND",
-    [202] = "AUTH_FAIL",
-    [203] = "ASSOC_FAIL",
-    [204] = "HANDSHAKE_TIMEOUT",
-};
+static const int BIT_STA_CONNECTED = BIT1;
+static const int BIT_RELOAD_CFG    = BIT2;
+static const int BIT_NTP_SYNC      = BIT3;
+static const int BIT_AHA_CFG       = BIT4;
+static const int BIT_AHA_RUN       = BIT5;
+static const int BIT_FW_RESET      = BIT6;
 
 static esp_err_t event_handler(void *ctx, system_event_t *event)
 {
-    tcpip_adapter_ip_info_t ap_ip_info;
-    esp_err_t result;
+    EventBits_t old, new;
+
+    old = xEventGroupGetBits(heph_event_group);
 
     switch(event->event_id){
-    case SYSTEM_EVENT_STA_START:
-        xEventGroupSetBits(heph_event_group, BIT_STA_STARTED);
-        esp_wifi_connect();
-        break;
-    case SYSTEM_EVENT_STA_STOP:
-        xEventGroupClearBits(heph_event_group, BIT_STA_STARTED);
-        break;
     case SYSTEM_EVENT_STA_GOT_IP:
-        xEventGroupSetBits(heph_event_group,
-                           (BIT_STA_CONNECTED | BIT_UPD_WIFICFG));
+        xEventGroupSetBits(heph_event_group, BIT_STA_CONNECTED);
         break;
     case SYSTEM_EVENT_STA_LOST_IP:
         xEventGroupClearBits(heph_event_group, BIT_STA_CONNECTED);
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
-        /* This is a workaround as ESP32 WiFi libs don't currently
-         * auto-reassociate. */
         xEventGroupClearBits(heph_event_group, BIT_STA_CONNECTED);
-        if(wifi_reasons[event->event_info.disconnected.reason]){
-            ESP_LOGE(TAG, "[%s] STA_DISCONNECTED: %s", __FUNCTION__,
-                     wifi_reasons[event->event_info.disconnected.reason]);
-        } 
-        switch(event->event_info.disconnected.reason){                         
-        case WIFI_REASON_NO_AP_FOUND:
-        case WIFI_REASON_ASSOC_LEAVE:
-        case WIFI_REASON_AUTH_FAIL:
-            break;
-        default:
-            esp_wifi_connect();
-            break;
-        }
-
-        break;
-    case SYSTEM_EVENT_AP_START:
-        xEventGroupSetBits(heph_event_group, BIT_AP_STARTED);
-        result = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_AP, &ap_ip_info);
-        if(result == ESP_OK){
-            ESP_LOGI(TAG, "~~~~~~~~~~~");
-            ESP_LOGI(TAG, "IP:" IPSTR, IP2STR(&ap_ip_info.ip));
-            ESP_LOGI(TAG, "MASK:" IPSTR, IP2STR(&ap_ip_info.netmask));
-            ESP_LOGI(TAG, "GW:" IPSTR, IP2STR(&ap_ip_info.gw));
-            ESP_LOGI(TAG, "~~~~~~~~~~~");
-        }
-        break;
-    case SYSTEM_EVENT_AP_STOP:
-        xEventGroupClearBits(heph_event_group, BIT_AP_STARTED);
-        break;
-    case SYSTEM_EVENT_AP_STACONNECTED:
-        ESP_LOGI(TAG, "station: " MACSTR " join, AID=%d\n",
-                 MAC2STR(event->event_info.sta_connected.mac),
-                 event->event_info.sta_connected.aid);
-
-        xEventGroupSetBits(heph_event_group, BIT_AP_CONNECTED);
-        break;
-    case SYSTEM_EVENT_AP_STADISCONNECTED:
-        ESP_LOGI(TAG, "station: " MACSTR " leave, AID=%d\n",
-                 MAC2STR(event->event_info.sta_disconnected.mac),
-                 event->event_info.sta_disconnected.aid);
-
-        xEventGroupClearBits(heph_event_group, BIT_AP_CONNECTED);
         break;
     default:
         break;
     }
 
-    cgiWifiEventCb(event);
+    new = xEventGroupGetBits(heph_event_group);
 
-    /* Wake up main task */
-    xEventGroupSetBits(heph_event_group, BIT_TRIGGER);
+    if(old != new){
+        /* Wake up main task */
+        xEventGroupSetBits(heph_event_group, BIT_TRIGGER);
+    }
 
     return ESP_OK;
-}
-
-static void
-init_wifi_cfg(struct heph_wifi_cfg *heph_cfg, struct heph_state *state)
-{
-    wifi_config_t *cfg;
-
-    cfg = &(state->ap_cfg);
-    memset(cfg, 0x0, sizeof(*cfg));
-
-    strlcpy((char *) cfg->ap.ssid, HEPH_AP_SSID, sizeof(cfg->ap.ssid));
-    cfg->ap.max_connection = 3;
-    cfg->ap.authmode = WIFI_AUTH_OPEN;
-
-    cfg = &(state->st_cfg);
-    memset(cfg, 0x0, sizeof(*cfg));
-
-    if(strlen(heph_cfg->ssid) > 0 && strlen(heph_cfg->pass) > 0){
-        state->mode = WIFI_MODE_STA;
-        strlcpy((char *) cfg->sta.ssid, heph_cfg->ssid, sizeof(cfg->sta.ssid));
-        strlcpy((char *) cfg->sta.password, heph_cfg->pass,
-                sizeof(cfg->sta.password));
-    } else {
-        state->mode = WIFI_MODE_APSTA;
-    }
-}
-
-static esp_err_t config_wifi(struct heph_state *state)
-{
-    EventBits_t events;
-    esp_err_t result;
-
-#if 0
-    result = esp_wifi_stop();
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_wifi_stop() failed", __func__);
-        goto err_out;
-    }
-#endif
-
-    result = esp_wifi_set_mode(state->mode);
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_wifi_set_mode() failed", __func__);
-        goto err_out;
-    }
-
-    result = esp_wifi_set_config(ESP_IF_WIFI_STA, &(state->st_cfg));
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_wifi_set_config() failed for STA", __func__);
-        goto err_out;
-    }
-
-    if(state->mode == WIFI_MODE_APSTA){
-        result = esp_wifi_set_config(ESP_IF_WIFI_AP, &(state->ap_cfg));
-        if(result != ESP_OK){
-            ESP_LOGE(TAG, "[%s] esp_wifi_set_config() failed for AP", __func__);
-            goto err_out;
-        }
-    }
-
-    events = xEventGroupGetBits(heph_event_group);
-    if(!(events & BIT_STA_STARTED)){
-        result = esp_wifi_start();
-        if(result != ESP_OK){
-            ESP_LOGE(TAG, "[%s] esp_wifi_start() failed", __func__);
-            goto err_out;
-        }
-    }
-
-err_out:
-    return result;
-}
-
-static esp_err_t init_wifi(void)
-{
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_err_t result;
-
-    tcpip_adapter_init();
-
-    result = initCgiWifi();
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] initCgiWifi() failed", __func__);
-        goto err_out;
-    }
-    
-    result = esp_event_loop_init(event_handler, NULL);
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_event_loop_init() failed", __func__);
-        goto err_out;
-    }
-
-    result = esp_wifi_init(&cfg);
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_wifi_init() failed", __func__);
-        goto err_out;
-    }
-
-    result = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_wifi_set_storage() failed", __func__);
-        goto err_out;
-    }
-
-err_out:
-    return result;
-}
-
-esp_err_t heph_connected(void)
-{
-    wifi_ap_record_t wapr;
-    tcpip_adapter_ip_info_t info;
-    EventBits_t events;
-    esp_err_t result;
-
-    /* Skip data retrieval if we have connectivity or network issues */
-    events = xEventGroupGetBits(heph_event_group);
-    if(!(events & BIT_STA_CONNECTED)){
-        result = ESP_ERR_NOT_FOUND;
-        goto err_out;
-    }
-
-    result = esp_wifi_sta_get_ap_info(&wapr);
-    if(result != ESP_OK){
-        goto err_out;
-    }
-
-    result = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &info);
-    if(result != ESP_OK || info.ip.addr == IPADDR_ANY){
-        result = ESP_ERR_NOT_FOUND;
-        goto err_out;
-    }
-
-err_out:
-    return result;
 }
 
 static void update_sntp(void)
@@ -355,14 +130,13 @@ static void update_sntp(void)
     time_t now;
     struct tm tm;
     EventBits_t events;
-    bool running;
+    bool connected, running;
     char buff[32];
-    esp_err_t result;
 
     running = sntp_enabled();
 
-    result = heph_connected();
-    if(result != ESP_OK){
+    connected = esp_wmngr_is_connected();
+    if(!connected){
         if(running){
             ESP_LOGI(TAG, "Stopping SNTP");
             sntp_stop();
@@ -384,25 +158,22 @@ static void update_sntp(void)
             localtime_r(&now, &tm);
 
             if(tm.tm_year > (2016 - 1900)){
-                ESP_LOGI(TAG, "[%s] Got NTP time sync: %s", __func__, asctime_r(&tm, buff));
+                ESP_LOGI(TAG, "[%s] Got NTP time sync: %s",
+                        __func__, asctime_r(&tm, buff));
+
                 xEventGroupSetBits(heph_event_group, BIT_NTP_SYNC);
             }
         }
     }
 }
 
-esp_err_t heph_set_cfg(struct heph_wifi_cfg *cfg, bool reload)
+esp_err_t heph_set_cfg(struct heph_cfg *cfg, bool reload)
 {
     esp_err_t result;
     nvs_handle handle;
 
-    if(wifi_cfg_lock == NULL){
+    if(cfg_lock == NULL){
         return ESP_ERR_TIMEOUT;
-    }
-
-    if((strlen(cfg->ssid) == 0) || (strlen(cfg->pass) == 0)){
-        ESP_LOGE(TAG, "[%s] Config invalid", __func__);
-        return ESP_ERR_INVALID_ARG;
     }
 
     result = nvs_open(HEPH_NVS_NAMESPC, NVS_READWRITE, &handle);
@@ -410,48 +181,38 @@ esp_err_t heph_set_cfg(struct heph_wifi_cfg *cfg, bool reload)
         return result;
     }
 
-    if(xSemaphoreTake(wifi_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
+    if(xSemaphoreTake(cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
         result = ESP_ERR_TIMEOUT;
-        goto err_out;
-    }
-
-    result = nvs_set_str(handle, "wifi_ssid", cfg->ssid);
-    if(result != ESP_OK){
-        goto err_out_unlock;
-    }
-
-    result = nvs_set_str(handle, "wifi_pass", cfg->pass);
-    if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit;
     }
 
     /* Timezone is optional */
     if(strlen(cfg->tz) > 0){
         result = nvs_set_str(handle, "timezone", cfg->tz);
         if(result != ESP_OK){
-            goto err_out_unlock;
+            goto on_exit_unlock;
         }
     }
 
     result = nvs_commit(handle);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     if(reload){
         xEventGroupSetBits(heph_event_group, (BIT_RELOAD_CFG | BIT_TRIGGER));
     }
 
-err_out_unlock:
-    xSemaphoreGive(wifi_cfg_lock);
+on_exit_unlock:
+    xSemaphoreGive(cfg_lock);
 
-err_out:
+on_exit:
     nvs_close(handle);
 
     return result;
 }
 
-esp_err_t heph_get_cfg(struct heph_wifi_cfg *cfg, enum cfg_load_type from)
+esp_err_t heph_get_cfg(struct heph_cfg *cfg, enum cfg_load_type from)
 {
     esp_err_t result;
     size_t len;
@@ -461,7 +222,7 @@ esp_err_t heph_get_cfg(struct heph_wifi_cfg *cfg, enum cfg_load_type from)
         return ESP_ERR_INVALID_ARG;
     }
 
-    if(wifi_cfg_lock == NULL){
+    if(cfg_lock == NULL){
         return ESP_ERR_TIMEOUT;
     }
 
@@ -472,30 +233,18 @@ esp_err_t heph_get_cfg(struct heph_wifi_cfg *cfg, enum cfg_load_type from)
         }
     }
 
-    if(xSemaphoreTake(wifi_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
+    if(xSemaphoreTake(cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
         result = ESP_ERR_TIMEOUT;
-        goto err_out;
+        goto on_exit;
     }
 
     if(from == cfg_ram){
-        memmove(cfg, &wifi_cfg, sizeof(*cfg));
+        memmove(cfg, &heph_cfg, sizeof(*cfg));
         result = ESP_OK;
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     memset(cfg, 0x0, sizeof(*cfg));
-
-    len = sizeof(cfg->ssid);
-    result = nvs_get_str(handle, "wifi_ssid", cfg->ssid, &len);
-    if(result != ESP_OK){
-        goto err_out_unlock;
-    }
-
-    len = sizeof(cfg->pass);
-    result = nvs_get_str(handle, "wifi_pass", cfg->pass, &len);
-    if(result != ESP_OK){
-        goto err_out_unlock;
-    }
 
     /* Try to read timezone. Fall back to default if not set */
     len = sizeof(cfg->tz);
@@ -505,10 +254,10 @@ esp_err_t heph_get_cfg(struct heph_wifi_cfg *cfg, enum cfg_load_type from)
         result = ESP_OK;
     }
 
-err_out_unlock:
-    xSemaphoreGive(wifi_cfg_lock);
+on_exit_unlock:
+    xSemaphoreGive(cfg_lock);
 
-err_out:
+on_exit:
     if(from == cfg_nvs){
         nvs_close(handle);
     }
@@ -519,84 +268,30 @@ err_out:
 static esp_err_t reload_cfg(void)
 {
     esp_err_t result;
-    struct heph_wifi_cfg cfg;
+    struct heph_cfg cfg;
 
     result = heph_get_cfg(&cfg, cfg_nvs);
     if(result != ESP_OK){
         ESP_LOGE(TAG, "[%s] heph_get_cfg() failed", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
-    if(xSemaphoreTake(wifi_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
+    if(xSemaphoreTake(cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
         result = ESP_ERR_TIMEOUT;
-        goto err_out;
+        goto on_exit;
     }
 
-    memmove(&wifi_cfg, &cfg, sizeof(wifi_cfg));
+    memmove(&heph_cfg, &cfg, sizeof(heph_cfg));
 
-    xSemaphoreGive(wifi_cfg_lock);
+    xSemaphoreGive(cfg_lock);
 
-    setenv("TZ", wifi_cfg.tz, 1);
-    tzset();
+    if(strlen(heph_cfg.tz) > 0){
+        setenv("TZ", heph_cfg.tz, 1);
+        tzset();
+    }
 
-    init_wifi_cfg(&wifi_cfg, &heph_state);
-
-    result = config_wifi(&heph_state);
-
-err_out:
+on_exit:
     return result;
-}
-
-static void update_wifi_cfg(void)
-{
-    EventBits_t events;
-    wifi_config_t wifi_cfg;
-    wifi_sta_config_t *sta;
-    wifi_mode_t mode;
-    struct heph_wifi_cfg heph_cfg;
-    esp_err_t result;
-
-    events = xEventGroupClearBits(heph_event_group, BIT_UPD_WIFICFG);
-    
-    result = esp_wifi_get_mode(&mode);
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_wifi_get_mode() failed", __func__);
-        goto err_out;
-    }
-
-    if(mode != WIFI_MODE_STA || !(events & BIT_STA_CONNECTED)){
-       goto err_out;
-    }
-
-    result = esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
-    if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_wifi_get_config() failed", __func__);
-        goto err_out;
-    }
-
-    memset(&heph_cfg, 0x0, sizeof(heph_cfg));
-    result = heph_get_cfg(&heph_cfg, cfg_nvs);
-    if(result == ESP_ERR_TIMEOUT){
-        xEventGroupSetBits(heph_event_group, BIT_UPD_WIFICFG);
-        goto err_out;
-    }
-
-    sta = &wifi_cfg.sta;
-    if(   strncmp(heph_cfg.ssid, (char *)sta->ssid, sizeof(sta->ssid))
-       || strncmp(heph_cfg.pass, (char *)sta->password, sizeof(sta->password)))
-    {
-        strlcpy(heph_cfg.ssid, (char *)sta->ssid, sizeof(heph_cfg.ssid));
-        strlcpy(heph_cfg.pass, (char *)sta->password, sizeof(heph_cfg.pass));
-        result = heph_set_cfg(&heph_cfg, true);
-        if(result != ESP_OK){
-            ESP_LOGE(TAG, "[%s] heph_set_config() failed", __func__);
-            xEventGroupSetBits(heph_event_group, BIT_UPD_WIFICFG);
-            goto err_out;
-        }
-    }
-
-err_out:
-    return;
 }
 
 static void timer_cb(TimerHandle_t timer)
@@ -617,10 +312,10 @@ static esp_err_t check_aha_cfg(void)
     result = aha_get_cfg(&aha_cfg, cfg_nvs);
     if(result == ESP_OK){
         xEventGroupSetBits(heph_event_group, BIT_AHA_CFG);
-        goto err_out;
+        goto on_exit;
     }
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -655,14 +350,14 @@ static esp_err_t setup_gpios(void)
     result = gpio_install_isr_service(0);
     if(result != ESP_OK){
         ESP_LOGE(TAG, "[%s] gpio_install_isr_service() failed", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
     result = gpio_isr_handler_add(GPIO_FW_RESET, gpio_isr_handler,
                                   (void*) GPIO_FW_RESET);
     if(result != ESP_OK){
         ESP_LOGE(TAG, "[%s] gpio_isr_handler_add() failed", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
     memset(&cfg, 0x0, sizeof(cfg));
@@ -675,7 +370,7 @@ static esp_err_t setup_gpios(void)
     result = gpio_config(&cfg);
     if(result != ESP_OK){
         ESP_LOGE(TAG, "[%s] gpio_config() failed for reset button", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
     memset(&cfg, 0x0, sizeof(cfg));
@@ -688,10 +383,10 @@ static esp_err_t setup_gpios(void)
     result = gpio_config(&cfg);
     if(result != ESP_OK){
         ESP_LOGE(TAG, "[%s] gpio_config() failed for HEAT/LED", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -837,7 +532,7 @@ void app_main(void)
     result = setup_gpios();
     if(result != ESP_OK){
         ESP_LOGE(TAG, "GPIO init failed");
-        goto err_out;
+        goto on_exit;
     }
 
     result = nvs_flash_init();
@@ -848,39 +543,40 @@ void app_main(void)
 
     if(result != ESP_OK){
         ESP_LOGE(TAG, "NVS init failed");
-        goto err_out;
+        goto on_exit;
     }
 
-    wifi_cfg_lock = xSemaphoreCreateMutex();
-    if(wifi_cfg_lock == NULL){
-        ESP_LOGE(TAG, "Creating wifi_cfg_lock failed.");
-        goto err_out;
+    /* Set time zone to compiled-in default. */
+    setenv("TZ", TIMEZONE, 1);
+    tzset();
+
+    cfg_lock = xSemaphoreCreateMutex();
+    if(cfg_lock == NULL){
+        ESP_LOGE(TAG, "Creating cfg_lock failed.");
+        goto on_exit;
     }
 
     heph_event_group = xEventGroupCreate();
     if(heph_event_group == NULL){
         ESP_LOGE(TAG, "Creating heph_event_group failed");
-        goto err_out;
+        goto on_exit;
     }
 
-    init_wifi();
-
-    /* put WiFi into setup-mode if there is no configuration in NVS */
-    result = heph_get_cfg(&wifi_cfg, cfg_nvs);
+    /* Try reading configuration from NVS and set compiled in defaults if it *\
+    \* does not exists.                                                      */
+    result = heph_get_cfg(&heph_cfg, cfg_nvs);
     if(result != ESP_OK){
         ESP_LOGI(TAG, "No config in NVS, entering setup mode");
 
-        memset(&wifi_cfg, 0x0, sizeof(wifi_cfg));
-        strlcpy(wifi_cfg.tz, TIMEZONE, sizeof(wifi_cfg.tz));
-        setenv("TZ", wifi_cfg.tz, 1);
-        tzset();
+        memset(&heph_cfg, 0x0, sizeof(heph_cfg));
+        strlcpy(heph_cfg.tz, TIMEZONE, sizeof(heph_cfg.tz));
+        (void) heph_set_cfg(&heph_cfg, true);
+    }
 
-        init_wifi_cfg(&wifi_cfg, &heph_state);
-
-        result = config_wifi(&heph_state);
-        if(result != ESP_OK){
-            ESP_LOGE(TAG, "Entering setup mode failed");
-        }
+    result = esp_event_loop_init(event_handler, NULL);
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "[%s] esp_event_loop_init() failed", __func__);
+        goto on_exit;
     }
 
     xTaskCreate(&avm_aha_task, "avm_aha_task", 8192, NULL, 5, NULL);
@@ -890,13 +586,13 @@ void app_main(void)
 
     if(heph_timer == NULL){
         ESP_LOGE(TAG, "Creating heph_timer failed.");
-        goto err_out;
+        goto on_exit;
     }
 
     result = xTimerStart(heph_timer, portMAX_DELAY);
     if(result == pdFAIL){
         ESP_LOGE(TAG, "Starting heph_timer failed.");
-        goto err_out;
+        goto on_exit;
     }
 
     fwrst_timer = xTimerCreate("FWRST_Timer", pdMS_TO_TICKS(2000),
@@ -904,7 +600,13 @@ void app_main(void)
 
     if(fwrst_timer == NULL){
         ESP_LOGE(TAG, "Creating fwrst_timer failed.");
-        goto err_out;
+        goto on_exit;
+    }
+
+    result = esp_wmngr_init();
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "esp_wmngr_init() failed.");
+        goto on_exit;
     }
 
     http_srv_init();
@@ -916,10 +618,6 @@ void app_main(void)
         events = xEventGroupWaitBits(heph_event_group, BIT_TRIGGER,
                                      true, false, portMAX_DELAY);
 
-        if(events & BIT_UPD_WIFICFG){
-            update_wifi_cfg();
-        }
-
         if(events & BIT_RELOAD_CFG){
             ESP_LOGI(TAG, "Reloading config");
             xEventGroupClearBits(heph_event_group, BIT_RELOAD_CFG);
@@ -930,6 +628,23 @@ void app_main(void)
         }
 
         fw_reset = check_fwreset();
+
+#if defined(AUTO_WPS)
+#warning AUTO_WPS enabled
+        /*
+         * Trigger WPS if no valid WiFi config is found. Only usefull for
+         * development purposes.
+         */
+        if(!esp_wmngr_nvs_valid()
+            && (esp_wmngr_get_state() == wmngr_state_idle))
+        {
+            result = esp_wmngr_start_wps();
+            if(result != ESP_OK){
+                ESP_LOGE(TAG, "[%s] start_wps() failed: %s\n",
+                        __func__, esp_err_to_name(result));
+            }
+        }
+#endif /* defined(AUTO_WPS) */
 
         update_sntp();
 
@@ -967,9 +682,12 @@ void app_main(void)
         software_reset();
     }
 
-err_out:
+on_exit:
 
     ESP_LOGE(TAG, "Enter error state");
+    /* Try turning of heater. */
+    /* TODO: Maybe make data LED flash to signal that there is a problem. */
+    heph_heat_set(false);
     while(1)
         ;
 }

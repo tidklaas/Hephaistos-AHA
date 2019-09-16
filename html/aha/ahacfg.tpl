@@ -8,10 +8,28 @@
     <p>
         Please enter new user name and password.<br>
 
-        <input type="text" name="fbox_user" value="%fbox_user%"> <br />
-        <input type="text" name="fbox_pass" value="%fbox_pass%"> <br />
-        <input type="text" name="fbox_addr" value="%fbox_addr%"> <br />
-        <input type="text" name="fbox_port" value="%fbox_port%"> <br />
+        <table>
+        <tr>
+        <td>F!Box User</td>
+        <td><input type="text" name="fbox_user" value="%fbox_user%"></td>
+        </tr>
+
+        <tr>
+        <td>F!Box Pass</td>
+        <td><input type="text" name="fbox_pass" value="%fbox_pass%"></td>
+        </tr>
+
+        <tr>
+        <td>F!Box Addr</td>
+        <td><input type="text" name="fbox_addr" value="%fbox_addr%"></td>
+        </tr>
+
+        <tr>
+        <td>F!Box Port</td>
+        <td><input type="text" name="fbox_port" value="%fbox_port%"></td>
+        </tr>
+        </table>
+
         <input type="submit" name="connect" value="Update">
     </p>
 </div>

@@ -31,8 +31,8 @@
 #define HEPH_NVS_NAMESPC    "hephaistos"
 
 extern esp_err_t heph_connected(void);
-extern esp_err_t heph_get_cfg(struct heph_wifi_cfg *cfg, enum cfg_load_type from);
-extern esp_err_t heph_set_cfg(struct heph_wifi_cfg *cfg, bool reload);
+extern esp_err_t heph_get_cfg(struct heph_cfg *cfg, enum cfg_load_type from);
+extern esp_err_t heph_set_cfg(struct heph_cfg *cfg, bool reload);
 extern void heph_led_set(bool on);
 extern void heph_heat_set(bool on);
 

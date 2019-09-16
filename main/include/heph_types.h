@@ -31,9 +31,7 @@
 #define MAX_PASS_LEN        33
 #define MAX_TZ_LEN          65
 
-struct heph_wifi_cfg {
-    char ssid[MAX_SSID_LEN];
-    char pass[MAX_PASS_LEN];
+struct heph_cfg {
     char tz[MAX_TZ_LEN];
 };
 
