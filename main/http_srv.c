@@ -113,11 +113,13 @@ HttpdBuiltInUrl urls_setup[]={
 	
 	ROUTE_REDIRECT("/flash", "/flash/index.html"),
 	ROUTE_REDIRECT("/flash/", "/flash/index.html"),
-	ROUTE_CGI_ARG("/flash/next", cgiGetFirmwareNext, &upload_params),
+	ROUTE_CGI("/flash/flashinfo.json", cgiGetFlashInfo),
+	ROUTE_CGI("/flash/setboot", cgiSetBoot),
 	ROUTE_CGI_ARG("/flash/upload", cgiUploadFirmware, &upload_params),
+	ROUTE_CGI_ARG("/flash/erase", cgiEraseFlash, &upload_params),
 	ROUTE_CGI("/flash/reboot", cgiRebootFirmware),
 
-    ROUTE_FILESYSTEM(),
+	ROUTE_FILESYSTEM(),
 
 	ROUTE_END()
 };
