@@ -1,6 +1,6 @@
 /*
  * This file is part of the Hephaistos-AHA project.
- * Copyright (C) 2018  Tido Klaassen <tido_hephaistos@4gh.eu>
+ * Copyright (C) 2018-2019 Tido Klaassen <tido_hephaistos@4gh.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -9,7 +9,7 @@
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the                                
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
@@ -23,10 +23,6 @@
 
 #include "heph_types.h"
 
-#ifndef ARRAY_SIZE
-#define ARRAY_SIZE(x)   (sizeof(x) / sizeof(*(x)))
-#endif
-
 #define HEPH_AP_SSID        "Hephaistos"
 #define HEPH_NVS_NAMESPC    "hephaistos"
 
@@ -36,5 +32,5 @@ extern esp_err_t heph_set_cfg(struct heph_cfg *cfg, bool reload);
 extern void heph_led_set(bool on);
 extern void heph_heat_set(bool on);
 
-#endif // _HEPHAISTOS_H_
+#endif /* _HEPHAISTOS_H_ */
 

@@ -1,6 +1,6 @@
 /*
  * This file is part of the Hephaistos-AHA project.
- * Copyright (C) 2018  Tido Klaassen <tido_hephaistos@4gh.eu>
+ * Copyright (C) 2018-2019  Tido Klaassen <tido_hephaistos@4gh.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -23,9 +23,6 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <sys/socket.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <errno.h>
 
 #include <sdkconfig.h>
@@ -34,13 +31,10 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
-#include "esp_wifi.h"
-#include "esp_event_loop.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
-#include "driver/gpio.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -97,8 +91,10 @@ static const char *HKR_REQ = "/webservices/homeautoswitch.lua?"
 #define HTTP_REQ_SIZE   1024
 #define INVALID_SID     "0000000000000000"
 
-/* Pointer to current aha_data available through aha_data_get().
- * Once initialised, will always hold a pointer to a valid data set */
+/*
+ * Pointer to current aha_data available through aha_data_get().
+ * Once initialised, will always hold a pointer to a valid data set.
+ */
 static struct aha_data *curr_aha_data = NULL;
 static SemaphoreHandle_t aha_data_lock = NULL;
 static volatile int data_created = 0;
@@ -111,17 +107,18 @@ static struct aha_data *create_data(void)
     data = calloc(sizeof(*data), 1);
     if(data == NULL){
         ESP_LOGE(TAG, "Out of memory for aha_data");
-        goto err_out;
+        goto on_exit;
     }
 
     kref_init(&(data->ref_cnt));
     INIT_KLIST_HEAD(&(data->dev_head));
     INIT_KLIST_HEAD(&(data->grp_head));
+    data->heat_on = false;
 
     ++data_created;
     ESP_LOGD(TAG, "Data created: %d released: %d", data_created, data_released);
 
-err_out:
+on_exit:
     return data;
 }
 
@@ -134,7 +131,7 @@ static void release_data(struct kref *ref_cnt)
 
     klist_for_each_entry_safe(group, tmp_grp, &(data->grp_head), grp_list)
     {
-        /* remove all devices from the group's member list */
+        /* Remove all devices from the group's member list. */
         klist_for_each_entry_safe(device, tmp_dev,
                                   &(group->member_list), member_list)
         {
@@ -142,7 +139,7 @@ static void release_data(struct kref *ref_cnt)
             device->group = NULL;
         }
 
-        /* remove group from group list */
+        /* Remove group from group list. */
         klist_del_init(&(group->grp_list));
 
         free(group);
@@ -150,9 +147,13 @@ static void release_data(struct kref *ref_cnt)
 
     klist_for_each_entry_safe(device, tmp_dev, &(data->dev_head), dev_list)
     {
-        /* remove device from device list */
+        /* Remove device from device list. */
         klist_del(&(device->dev_list));
         free(device);
+    }
+
+    if(data->msg != NULL){
+        free((void *) data->msg);
     }
 
     free(data);
@@ -221,13 +222,15 @@ int gen_sid_auth(struct auth_data *data)
     result = 0;
     memset(data->auth, 0x0, sizeof(data->auth));
 
-    /* Auth request is the hex string of md5-sum of UTF-16LE string
+    /*
+     * Auth request is the hex string of md5-sum of UTF-16LE string
      * "<nonce>-<password>", where characters must be in the ISO-8859-1
-     * range... m( */
+     * range... m(
+     */
     if(sizeof(buf) < 2 * (strlen(data->nonce) + strlen(data->pass) + 1)){
         ESP_LOGE(TAG, "[%s] Auth data too big.", __func__);
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     curr = 0;
@@ -256,7 +259,7 @@ int gen_sid_auth(struct auth_data *data)
         sprintf(&(data->auth[2 * i]), "%02x", md5sum[i]);
     }
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -285,7 +288,7 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
     if(result != 0 || info == NULL){
         ESP_LOGE(TAG, "DNS lookup failed err=%d (%s) info=%p",
                    result, strerror(errno), info);
-        goto err_out;
+        goto on_exit;
     }
 
     sock = socket(info->ai_family, info->ai_socktype, 0);
@@ -293,14 +296,14 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
         ESP_LOGE(TAG, "[%s] Failed to allocate socket: %s",
                    __func__, strerror(errno));
         result = sock;
-        goto err_out;
+        goto on_exit;
     }
 
     result = connect(sock, info->ai_addr, info->ai_addrlen);
     if(result != 0){
         ESP_LOGE(TAG, "[%s] socket connect failed: %s",
                    __func__, strerror(errno));
-        goto err_out;
+        goto on_exit;
     }
 
     written = 0;
@@ -310,7 +313,7 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
         if(result < 0){
             ESP_LOGE(TAG, "[%s] socket send failed: %s",
                        __func__, strerror(errno));
-            goto err_out;
+            goto on_exit;
         }
         written += result;
         len -= result;
@@ -323,49 +326,57 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
     if(result < 0){
         ESP_LOGE(TAG, "[%s] setsockopt() failed: %s",
                    __func__, strerror(errno));
-        goto err_out;
+        goto on_exit;
     }
 
     body = 0;
     offset = 0;
     do{
-        /* Read data chunks from socket. The end-of-header marker might be
+        /*
+         * Read data chunks from socket. The end-of-header marker might be
          * spread over multiple reads, so the parser below will tell us the
-         * offset into the read buffer. */
+         * offset into the read buffer.
+         */
         len = sizeof(buf) - offset;
         memset(&(buf[offset]), 0x0, sizeof(buf) - offset);
         errno = 0;
         result = read(sock, (unsigned char *) &(buf[offset]), len);
         if(result < 0){
             ESP_LOGE(TAG, "[%s] read() failed: %s", __func__, strerror(errno));
-            goto err_out;
+            goto on_exit;
         }
 
-        /* connection closed? */
+        /* Connection closed? */
         if(result == 0){
             break;
         }
 
-        /* We received some data. Set up pointer to buffer and adjust length */
+        /* We received some data. Set up pointer to buffer and adjust length. */
         len = result + offset;
         reply = buf;
 
         if(body == 0){
-            /* We are looking for "\r\n\r\n" which separates HTTP header and
-             * body.  */
+            /*
+             * We are looking for "\r\n\r\n" which separates HTTP header and
+             * body.
+             */
 
             reply = memmem(buf, len, "\r\n\r\n", 4);
             if(reply == NULL){
-                /* Due to chunked reads we can not rely on the separator being
+                /*
+                 * Due to chunked reads we can not rely on the separator being
                  * received completely in one read. Therefore we move the last
                  * three bytes to the start of the buffer and continue reading
-                 * from the socket. */
+                 * from the socket.
+                 */
                 memmove(buf, &(buf[len - 3]), 3);
                 offset = 3;
             } else {
-                /* We found the start of the HTTP body. Adjust reply pointer
+                /*
+                 * We found the start of the HTTP body. Adjust reply pointer
                  * and data length so the rest of the reply can be fed to the
-                 * XML parser. */
+                 * XML parser.
+                 */
                 reply += 4;
                 len -= (reply - buf);
                 offset = 0;
@@ -378,15 +389,17 @@ static int do_http_req(char *host, char *service, dom_t **dom, const char *req)
             if(result != 0){
                 ESP_LOGE(TAG, "[%s] Incremental parse failed: %d",
                           __func__, result);
-                goto err_out;
+                goto on_exit;
             }
         }
     }while(1);
 
-err_out:
-    /* If we started parsing XML data, we have to make sure that the parsing
+on_exit:
+    /*
+     * If we started parsing XML data, we have to make sure that the parsing
      * gets finalised. Just calling XML_ParserFree() instead results in a
-     * serious memory leak. */
+     * serious memory leak.
+     */
     if(dom_parser != NULL){
         tmp = dom_parse_chunked_data(&dom_parser, dom, NULL, 0, 1);
         if(tmp != 0){
@@ -409,7 +422,7 @@ err_out:
         }
     }
 
-    /* Release any (partial) DOM on error and make sure we return NULL */
+    /* Release any (partial) DOM on error and make sure we return NULL. */
     if(result != 0 && *dom != NULL){
         ESP_LOGE(TAG, "[%s] Freeing dom", __func__);
         dom_free(*dom);
@@ -428,14 +441,14 @@ static int parse_attr_ul(dom_t *dom, const char *name, unsigned long *dst)
     val = dom_find_attr(dom->attr, name);
     if(val == NULL){
         result = -ENOENT;
-        goto err_out;
+        goto on_exit;
     }
 
     errno = 0;
     *dst = strtoul(val, NULL, 10);
     result = errno;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -449,14 +462,14 @@ parse_attr_long(dom_t *dom, const char *name, long *dst)
     val = dom_find_attr(dom->attr, name);
     if(val == NULL){
         result = -ENOENT;
-        goto err_out;
+        goto on_exit;
     }
 
     errno = 0;
     *dst = strtol(val, NULL, 10);
     result = errno;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -470,12 +483,12 @@ static int parse_data_ul(dom_t *dom, const char *name, unsigned long *dst)
     node = dom_find_node(dom, name);
     if(node == NULL){
         result = -ENOENT;
-        goto err_out;
+        goto on_exit;
     }
 
     if(node->data_len >= (sizeof(buf) - 1)){
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     memcpy(buf, node->data, node->data_len);
@@ -485,7 +498,7 @@ static int parse_data_ul(dom_t *dom, const char *name, unsigned long *dst)
     *dst = strtoul(buf, NULL, 10);
     result = errno;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -499,12 +512,12 @@ static int parse_data_long(dom_t *dom, const char *name, long *dst)
     node = dom_find_node(dom, name);
     if(node == NULL){
         result = -ENOENT;
-        goto err_out;
+        goto on_exit;
     }
 
     if(node->data_len >= (sizeof(buf) - 1)){
         result = -ENOSPC;
-        goto err_out;
+        goto on_exit;
     }
 
     memcpy(buf, node->data, node->data_len);
@@ -514,7 +527,7 @@ static int parse_data_long(dom_t *dom, const char *name, long *dst)
     *dst = strtol(buf, NULL, 10);
     result = errno;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -528,7 +541,7 @@ static int copy_attr_str(dom_t *dom, const char *name, char *dst, size_t len)
     attr = dom_find_attr(dom->attr, name);
     if(attr == NULL){
         result = -ENOENT;
-        goto err_out;
+        goto on_exit;
     }
 
     written = strlcpy(dst, attr, len);
@@ -536,7 +549,7 @@ static int copy_attr_str(dom_t *dom, const char *name, char *dst, size_t len)
         result = -ENOSPC;
     }
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -549,18 +562,18 @@ static int copy_data_str(dom_t *dom, const char *name, char *dst, size_t len)
     node = dom_find_node(dom, name);
     if(node == NULL){
         result = -ENOENT;
-        goto err_out;
+        goto on_exit;
     }
 
     if(node->data_len >= len){
         result = -ENOSPC;
-        goto err_out;
+        goto on_exit;
     }
 
     memcpy(dst, node->data, node->data_len);
     dst[node->data_len] = '\0';
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -581,11 +594,11 @@ parse_lock_state(dom_t *dom, const char *name, enum aha_lock_mode *state)
             break;
         default:
             result = -EINVAL;
-            goto err_out;
+            goto on_exit;
         }
     }
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -606,11 +619,11 @@ parse_switch_state(dom_t *dom, const char *name, enum aha_switch_state *state)
             break;
         default:
             result = -EINVAL;
-            goto err_out;
+            goto on_exit;
         }
     }
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -623,14 +636,14 @@ static int compare_data_str(dom_t *dom, const char *name, const char *val)
     node = dom_find_node(dom, name);
     if(node == NULL){
         result = -ENOENT;
-        goto err_out;
+        goto on_exit;
     }
 
     if(strncasecmp(val, node->data, node->data_len) != 0){
         result = 1;
     }
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -642,24 +655,24 @@ parse_switch_mode(dom_t *dom, const char *name, enum aha_switch_mode *mode)
     result = compare_data_str(dom, name, "auto");
     if(result < 0){
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     } else if(result == 0){
         *mode = aha_switch_auto;
-        goto err_out;
+        goto on_exit;
     }
 
     result = compare_data_str(dom, name, "manuell");
     if(result < 0){
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     } else if(result == 0){
         *mode = aha_switch_manual;
-        goto err_out;
+        goto on_exit;
     }
 
     result = -ENOENT;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -674,7 +687,7 @@ static int parse_group_entry(dom_t *dom, struct aha_device *entry)
     result = 0;
     node = dom_find_node(dom, "groupinfo");
     if(node == NULL){
-        goto err_out;
+        goto on_exit;
     }
 
     node = node->child;
@@ -683,7 +696,7 @@ static int parse_group_entry(dom_t *dom, struct aha_device *entry)
     if(result != 0 && result != -ENOENT){
         ESP_LOGE(TAG, "Parsing masterdeviceid failed for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
     result = 0;
 
@@ -691,7 +704,7 @@ static int parse_group_entry(dom_t *dom, struct aha_device *entry)
     if(result != 0){
         ESP_LOGE(TAG, "Copying member string failed for entry %s", entry->name);
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     tok = strtok_r(buf, ",", &saveptr);
@@ -704,7 +717,7 @@ static int parse_group_entry(dom_t *dom, struct aha_device *entry)
             ESP_LOGE(TAG, "Error parsing group members for entry %s",
                      entry->name);
             result = errno;
-            goto err_out;
+            goto on_exit;
         }
 
         entry->grp.members[entry->grp.member_cnt] = val;
@@ -714,7 +727,7 @@ static int parse_group_entry(dom_t *dom, struct aha_device *entry)
 
     entry->grp.present = true;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -726,7 +739,7 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
     result = 0;
     node = dom_find_node(dom, "hkr");
     if(node == NULL){
-        goto err_out;
+        goto on_exit;
     }
 
     node = node->child;
@@ -735,34 +748,34 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing actual temperature for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_data_ul(node, "tsoll", &(entry->hkr.set_temp));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing set temperature for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_data_ul(node, "komfort", &(entry->hkr.comfort_temp));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing comfort temperature for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_data_ul(node, "absenk", &(entry->hkr.eco_temp));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing eco temperature for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_data_ul(node, "errorcode", &(entry->hkr.error));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing error code for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     if(dom_find_node(node, "battery")){
@@ -770,7 +783,7 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
         if(result != 0){
             ESP_LOGE(TAG, "Error parsing battery level for entry %s",
                        entry->name);
-            goto err_out;
+            goto on_exit;
         }
     } else {
         entry->hkr.batt_level = 100;
@@ -781,7 +794,7 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
         if(result != 0){
             ESP_LOGE(TAG, "Error parsing battery status for entry %s",
                        entry->name);
-            goto err_out;
+            goto on_exit;
         }
     } else {
         entry->hkr.batt_low = 0;
@@ -793,7 +806,7 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
         if(result != 0){
             ESP_LOGE(TAG, "Error parsing summer status for entry %s",
                        entry->name);
-            goto err_out;
+            goto on_exit;
         }
     } else {
         entry->hkr.summer_act = 0;
@@ -805,7 +818,7 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
         if(result != 0){
             ESP_LOGE(TAG, "Error parsing holiday status for entry %s",
                        entry->name);
-            goto err_out;
+            goto on_exit;
         }
     } else {
         entry->hkr.holiday_act = 0;
@@ -817,7 +830,7 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
         if(result != 0){
             ESP_LOGE(TAG, "Error parsing holiday status for entry %s",
                        entry->name);
-            goto err_out;
+            goto on_exit;
         }
     } else {
         entry->hkr.window_open = 0;
@@ -827,32 +840,32 @@ static int parse_hkr_entry(dom_t *dom, struct aha_device *entry)
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing next change time for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_data_ul(node, "tchange", &(entry->hkr.next_temp));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing next change temperature for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_lock_state(node, "lock", &(entry->hkr.lock));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing hkr lock state for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_lock_state(node, "devicelock", &(entry->hkr.device_lock));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing hkr device lock state for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     entry->hkr.present = true;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -864,7 +877,7 @@ static int parse_swi_entry(dom_t *dom, struct aha_device *entry)
     result = 0;
     node = dom_find_node(dom, "switch");
     if(node == NULL){
-        goto err_out;
+        goto on_exit;
     }
 
     node = node->child;
@@ -872,14 +885,14 @@ static int parse_swi_entry(dom_t *dom, struct aha_device *entry)
     result = parse_switch_state(dom, "state", &(entry->swi.state));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing switch state for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
 
     }
 
     result = parse_switch_mode(dom, "mode", &(entry->swi.mode));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing switch state for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
 
     }
 
@@ -887,19 +900,19 @@ static int parse_swi_entry(dom_t *dom, struct aha_device *entry)
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing switch lock state for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_lock_state(node, "devicelock", &(entry->swi.device_lock));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing switch device lock state for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     entry->swi.present = true;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -911,7 +924,7 @@ static int parse_pwr_entry(dom_t *dom, struct aha_device *entry)
     result = 0;
     node = dom_find_node(dom, "powermeter");
     if(node == NULL){
-        goto err_out;
+        goto on_exit;
     }
 
     node = node->child;
@@ -919,18 +932,18 @@ static int parse_pwr_entry(dom_t *dom, struct aha_device *entry)
     result = parse_data_ul(node, "power", &(entry->pwr.power));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing power for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_data_ul(node, "energy", &(entry->pwr.energy));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing energy for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     entry->pwr.present = true;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -942,7 +955,7 @@ static int parse_temp_entry(dom_t *dom, struct aha_device *entry)
     result = 0;
     node = dom_find_node(dom, "temperature");
     if(node == NULL){
-        goto err_out;
+        goto on_exit;
     }
 
     node = node->child;
@@ -950,19 +963,19 @@ static int parse_temp_entry(dom_t *dom, struct aha_device *entry)
     result = parse_data_long(node, "celsius", &(entry->temp.temp_c));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing temperature for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_data_long(node, "offset", &(entry->temp.offset));
     if(result != 0){
         ESP_LOGE(TAG, "Error parsing temperature offset for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     entry->temp.present = true;
 
-err_out:
+on_exit:
     return result;
 }
 
@@ -978,7 +991,7 @@ static struct aha_device *parse_entry(dom_t *dom)
     if(entry == NULL){
         ESP_LOGE(TAG, "Out of memory parsing device.");
         result = -ENOMEM;
-        goto err_out;
+        goto on_exit;
     }
 
     INIT_KLIST_HEAD(&(entry->dev_list));
@@ -992,94 +1005,94 @@ static struct aha_device *parse_entry(dom_t *dom)
     }else{
         ESP_LOGE(TAG, "Invalid entry type %s", dom->name);
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     result = copy_data_str(dom, "name", entry->name, sizeof(entry->name));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing entry name failed");
-        goto err_out;
+        goto on_exit;
     }
 
     result = copy_attr_str(dom, "identifier", entry->identifier,
                            sizeof(entry->identifier));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing identifier failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = copy_attr_str(dom, "fwversion", entry->fw_version,
                            sizeof(entry->fw_version));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing fwversion failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = copy_attr_str(dom, "manufacturer", entry->manufacturer,
                            sizeof(entry->manufacturer));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing manufacturer failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = copy_attr_str(dom, "productname", entry->product_name,
                            sizeof(entry->product_name));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing productname failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_attr_ul(dom, "id", &(entry->id));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing ID failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_attr_ul(dom, "functionbitmask", &(entry->functions));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing functions failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_data_ul(dom->child, "present", &(entry->present));
     if(result != 0){
         ESP_LOGE(TAG, "Parsing present state failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_group_entry(dom->child, entry);
     if(result != 0){
         ESP_LOGE(TAG, "Parsing group info failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_hkr_entry(dom->child, entry);
     if(result != 0){
         ESP_LOGE(TAG, "Parsing hkr info failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_swi_entry(dom->child, entry);
     if(result != 0){
         ESP_LOGE(TAG, "Parsing switch info failed for entry %s", entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_pwr_entry(dom->child, entry);
     if(result != 0){
         ESP_LOGE(TAG, "Parsing powermeter info failed for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
     result = parse_temp_entry(dom->child, entry);
     if(result != 0){
         ESP_LOGE(TAG, "Parsing thermometer info failed for entry %s",
                  entry->name);
-        goto err_out;
+        goto on_exit;
     }
 
-err_out:
+on_exit:
     if(result != 0 && entry != NULL){
         free(entry);
         entry = NULL;
@@ -1102,18 +1115,20 @@ static struct aha_data *parse_dom(dom_t *dom)
     data = create_data();
     if(data == NULL){
         result = -ENOMEM;
-        goto err_out;
+        goto on_exit;
     }
 
     node = dom_find_node(dom, "devicelist");
     if(node == NULL){
         result = -ENOENT;
-        goto err_out;
+        goto on_exit;
     }
 
-    /* We parse the DOM in two passes. On the first pass we only handle
+    /*
+     * We parse the DOM in two passes. On the first pass we only handle
      * group entries. This makes sure that all groups are already in the
-     * group-list when we start parsing the "real" devices. */
+     * group-list when we start parsing the "real" devices.
+     */
     entry = dom_find_node(node->child, "group");
     while(entry != NULL){
         device = parse_entry(entry);
@@ -1123,16 +1138,20 @@ static struct aha_data *parse_dom(dom_t *dom)
         entry = dom_find_node(entry->next, "group");
     }
 
-    /* Second pass for the "real" devices. We need to check the entries
-     * in the group-list to see if this device is a member of that group. */
+    /*
+     * Second pass for the "real" devices. We need to check the entries
+     * in the group-list to see if this device is a member of that group.
+     */
     entry = dom_find_node(node->child, "device");
     while(entry != NULL){
         device = parse_entry(entry);
         if(device != NULL){
             klist_add_tail(&(device->dev_list), &(data->dev_head));
 
-            /* Loop over all groups and their members until we either
-             * find a match or run out of groups to check. */
+            /*
+             * Loop over all groups and their members until we either
+             * find a match or run out of groups to check.
+             */
             klist_for_each_entry(group, &(data->grp_head), grp_list)
             {
                 for(idx = 0; idx < group->grp.member_cnt; ++idx){
@@ -1154,7 +1173,7 @@ static struct aha_data *parse_dom(dom_t *dom)
         entry = dom_find_node(entry->next, "device");
     }
     
-err_out:
+on_exit:
     if(result != 0 && data != NULL){
         aha_data_release(data);
         data = NULL;
@@ -1246,7 +1265,12 @@ static void dump_data(struct aha_data *data)
 {
     struct aha_device *dev, *grp;
 
-    /* dump groups and its member devices */
+    /* Skip traversing data if nothing is going to be printed anyways. */
+    if(LOG_LOCAL_LEVEL < ESP_LOG_DEBUG){
+        goto on_exit;
+    }
+
+    /* Dump groups and its member devices. */
     klist_for_each_entry(grp, &(data->grp_head), grp_list){
         dump_device(grp, "");
         klist_for_each_entry(dev, &(grp->member_list), member_list){
@@ -1254,12 +1278,15 @@ static void dump_data(struct aha_data *data)
         }
     }
 
-    /* dump remaining devices not belonging to a group */
+    /* Dump remaining devices not belonging to a group. */
     klist_for_each_entry(dev, &(data->dev_head), dev_list){
         if(dev->group == NULL){
             dump_device(dev, "");
         }
     }
+
+on_exit:
+    return;
 }
 
 static int check_auth(struct auth_data *auth)
@@ -1277,44 +1304,44 @@ static int check_auth(struct auth_data *auth)
     if(req == NULL){
         ESP_LOGE(TAG, "Out of memory for request");
         result = -ENOMEM;
-        goto err_out;
+        goto on_exit;
     }
 
     written = snprintf(buf, sizeof(buf), SID_CHECK, auth->sid);
     if(written >= sizeof(buf)){
         ESP_LOGE(TAG, "SID check too big");
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf, aha_cfg.fbox_port);
     if(written >= HTTP_REQ_SIZE){
         ESP_LOGE(TAG, "HTTP SID check too big");
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     result = do_http_req(aha_cfg.fbox_addr, aha_cfg.fbox_port, &dom, req);
     if(result != 0){
         ESP_LOGE(TAG, "HTTP SID check failed");
-        goto err_out;
+        goto on_exit;
     }
 
     node = dom_find_node(dom, "SID");
     if(node && strncmp(node->data, INVALID_SID, node->data_len)){
         ESP_LOGD(TAG, "SID %s still valid", auth->sid);
-        goto err_out;
+        goto on_exit;
     }
 
     result = copy_data_str(dom, "Challenge", auth->nonce, sizeof(auth->nonce));
     if(result != 0){
-        goto err_out;
+        goto on_exit;
     }
 
     result = gen_sid_auth(auth);
     if(result != 0){
         ESP_LOGE(TAG, "Generating auth response failed.");
-        goto err_out;
+        goto on_exit;
     }
 
     dom_free(dom);
@@ -1326,32 +1353,32 @@ static int check_auth(struct auth_data *auth)
     if(written >= sizeof(buf)){
         ESP_LOGE(TAG, "SID request too big");
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf, aha_cfg.fbox_addr);
     if(written >= HTTP_REQ_SIZE){
         ESP_LOGE(TAG, "HTTP SID request too big");
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     result = do_http_req(aha_cfg.fbox_addr, aha_cfg.fbox_port, &dom, req);
     if(result != 0){
         ESP_LOGE(TAG, "HTTP SID request failed");
-        goto err_out;
+        goto on_exit;
     }
 
     result = copy_data_str(dom, "SID", auth->sid, sizeof(auth->sid));
     if(result != 0 || !strcmp(auth->sid, INVALID_SID)){
         ESP_LOGE(TAG, "Unable to retrieve valid SID");
         result = -EPERM;
-        goto err_out;
+        goto on_exit;
     }
 
     ESP_LOGD(TAG, "New SID: %s", auth->sid);
 
-err_out:
+on_exit:
     if(req != NULL){
         free(req);
     }
@@ -1378,30 +1405,30 @@ static dom_t *fetch_data(struct auth_data *auth)
     if(req == NULL){
         ESP_LOGE(TAG, "[%s]Out of memory for HTTP AHA request", __func__);
         result = -ENOMEM;
-        goto err_out;
+        goto on_exit;
     }
 
     written = snprintf(buf, sizeof(buf), HKR_REQ, auth->sid);
     if(written >= sizeof(buf)){
         ESP_LOGE(TAG, "[%s]HTTP AHA request too big", __func__);
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     written = snprintf(req, HTTP_REQ_SIZE, HTTP_REQ, buf, aha_cfg.fbox_addr);
     if(written >= HTTP_REQ_SIZE){
         ESP_LOGE(TAG, "[%s]HTTP AHA data request too big", __func__);
         result = -EINVAL;
-        goto err_out;
+        goto on_exit;
     }
 
     result = do_http_req(aha_cfg.fbox_addr, aha_cfg.fbox_port, &dom, req);
     if(result != 0){
         ESP_LOGE(TAG, "[%s]HTTP AHA data request failed", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
-err_out:
+on_exit:
     if(result != 0 && dom != NULL){
         dom_free(dom);
         dom = NULL;
@@ -1414,7 +1441,7 @@ err_out:
     return dom;
 }
 
-static enum aha_heat_mode dev_need_heat(struct aha_device *dev)
+static enum aha_heat_mode dev_needs_heat(struct aha_device *dev)
 {
     enum aha_heat_mode result;
     struct aha_hkr *hkr;
@@ -1422,53 +1449,56 @@ static enum aha_heat_mode dev_need_heat(struct aha_device *dev)
 
     hkr = &(dev->hkr);
 
-    /* default to off*/
+    /* Default to off. */
     result = aha_heat_off;
 
-    /* ignore if this is not a hkr */
+    /* Ignore if this is not a hkr. */
     if(hkr->present == false){
-        goto err_out;
+        goto on_exit;
     }
 
     if(hkr->set_temp == HEAT_FORCE_ON){
         result = aha_heat_on;
-        goto err_out;
+        goto on_exit;
     }
 
     if(hkr->set_temp == HEAT_FORCE_OFF){
         result = aha_heat_off;
-        goto err_out;
+        goto on_exit;
     }
 
-#if 0
     /* F!Box sometimes provides bogus temperature data after reboot. */
     if(hkr->act_temp == 0){
-        result = aha_heat_keep;
-        goto err_out;
+        result = aha_heat_off;
+        goto on_exit;
     }
-#endif
 
-    /* do not change heat mode if the target temparature will be set lower than
-     * the current actual temperature within the hysteresis time span        */
+    /*
+     * Do not change heat mode if the target temparature will be set lower than
+     * the current actual temperature within the hysteresis time span.
+     */
     time(&now);
     if((hkr->act_temp >= hkr->next_temp)
         && ((hkr->next_change - now) <= CONFIG_HYSTERESIS))
     {
         result = aha_heat_keep;
-        goto err_out;
+        goto on_exit;
     }
 
-    /* no imminent target temperature change ahead, just compare actual and
-     * target temperature           */
+    /*
+     * No imminent target temperature change ahead, just compare actual and
+     * target temperature.
+     */
     if(hkr->act_temp < hkr->set_temp){
         result = aha_heat_on;
     }
 
-err_out:
+on_exit:
     return result;
 }
 
-static enum aha_heat_mode need_heat(struct aha_data *data)
+static enum aha_heat_mode need_heat(struct aha_data *data,
+                                    enum aha_heat_mode mode)
 {
     struct aha_device *device;
     enum aha_heat_mode result, tmp;
@@ -1476,25 +1506,33 @@ static enum aha_heat_mode need_heat(struct aha_data *data)
     result = aha_heat_off;
 
     if(data == NULL){
-        goto err_out;
+        goto on_exit;
     }
 
     klist_for_each_entry(device, &(data->dev_head), dev_list){
-        tmp = dev_need_heat(device);
-        if(tmp >= aha_heat_on){
-            ESP_LOGI(TAG,"Needs Heat: %s", device->name);
-            result = tmp;
+        tmp = dev_needs_heat(device);
+        if(tmp == aha_heat_on){
+            /*
+             * If heater is going to be turned on, print device(s) that caused
+             * the change.
+             */
+            if(mode != aha_heat_on){
+                ESP_LOGI(TAG,"Needs Heat: %s", device->name);
+            }
+
+            data->heat_on = true;
         }
+
+        result = LWIP_MAX(tmp, result);
     }
 
-err_out:
-    return result;
-}
+    /* Only print updates on heater state when things actually change. */
+    if(result != aha_heat_keep && result != mode){
+        ESP_LOGI(TAG, "Fire %s!", data->heat_on ? "on" : "off");
+    }
 
-static void fire(bool on)
-{
-    ESP_LOGI(TAG, "Fire %s!", on ? "on" : "off");
-    heph_heat_set(on);
+on_exit:
+    return result;
 }
 
 static void timer_cb(TimerHandle_t timer)
@@ -1519,42 +1557,42 @@ esp_err_t aha_set_cfg(struct aha_cfg *cfg, bool reload)
 
     if(xSemaphoreTake(aha_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
         result = ESP_ERR_TIMEOUT;
-        goto err_out;
+        goto on_exit;
     }
 
     result = nvs_set_str(handle, "fbox_user", cfg->fbox_user);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     result = nvs_set_str(handle, "fbox_pass", cfg->fbox_pass);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     result = nvs_set_str(handle, "fbox_addr", cfg->fbox_addr);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     result = nvs_set_str(handle, "fbox_port", cfg->fbox_port);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     result = nvs_commit(handle);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     if(reload){
         xEventGroupSetBits(aha_event_group, BIT_RELOAD);
     }
 
-err_out_unlock:
+on_exit_unlock:
     xSemaphoreGive(aha_cfg_lock);
 
-err_out:
+on_exit:
     nvs_close(handle);
 
     return result;
@@ -1583,13 +1621,13 @@ esp_err_t aha_get_cfg(struct aha_cfg *cfg, enum cfg_load_type from)
 
     if(xSemaphoreTake(aha_cfg_lock, 100 * portTICK_PERIOD_MS) != pdTRUE){
         result = ESP_ERR_TIMEOUT;
-        goto err_out;
+        goto on_exit;
     }
 
     if(from == cfg_ram){
         memmove(cfg, &aha_cfg, sizeof(*cfg));
         result = ESP_OK;
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     memset(cfg, 0x0, sizeof(*cfg));
@@ -1597,31 +1635,31 @@ esp_err_t aha_get_cfg(struct aha_cfg *cfg, enum cfg_load_type from)
     len = sizeof(cfg->fbox_user);
     result = nvs_get_str(handle, "fbox_user", cfg->fbox_user, &len);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     len = sizeof(cfg->fbox_pass);
     result = nvs_get_str(handle, "fbox_pass", cfg->fbox_pass, &len);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     len = sizeof(cfg->fbox_addr);
     result = nvs_get_str(handle, "fbox_addr", cfg->fbox_addr, &len);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
     len = sizeof(cfg->fbox_port);
     result = nvs_get_str(handle, "fbox_port", cfg->fbox_port, &len);
     if(result != ESP_OK){
-        goto err_out_unlock;
+        goto on_exit_unlock;
     }
 
-err_out_unlock:
+on_exit_unlock:
     xSemaphoreGive(aha_cfg_lock);
 
-err_out:
+on_exit:
     if(from == cfg_nvs){
         nvs_close(handle);
     }
@@ -1635,7 +1673,7 @@ struct aha_data *aha_data_get(void)
 
     data = NULL;
     if(aha_data_lock == NULL || curr_aha_data == NULL){
-        goto err_out;
+        goto on_exit;
     }
 
     if(xSemaphoreTake(aha_data_lock, 100 * portTICK_PERIOD_MS) == pdTRUE){
@@ -1644,7 +1682,7 @@ struct aha_data *aha_data_get(void)
         xSemaphoreGive(aha_data_lock);
     }
 
-err_out:
+on_exit:
     return data;
 }
 
@@ -1685,29 +1723,31 @@ void avm_aha_task(void *pvParameters)
     result = esp_task_wdt_init(TWDT_TIMEOUT_S, true);
     if(result != 0){
         ESP_LOGE(TAG, "[%s]WDT setup failed.", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
     aha_data_lock = xSemaphoreCreateMutex();
     if(aha_data_lock == NULL){
         ESP_LOGE(TAG, "[%s]Creating aha_data_lock failed.", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
     aha_cfg_lock = xSemaphoreCreateMutex();
     if(aha_cfg_lock == NULL){
         ESP_LOGE(TAG, "[%s]Creating aha_cfg_lock failed.", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
     aha_event_group = xEventGroupCreate();
     if(aha_event_group == NULL){
         ESP_LOGE(TAG, "[%s]Creating aha_event_group failed.", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
-    /* Force main loop to wait until released from main task.
-     * Also trigger loading of config from NVS.                       */
+    /*
+     * Force main loop to wait until released from main task.
+     * Also trigger reloading of config from NVS.
+     */
     xEventGroupSetBits(aha_event_group, (BIT_SUSPEND | BIT_RELOAD));
 
     aha_timer = xTimerCreate("AHA_Timer", pdMS_TO_TICKS(5000), pdTRUE,
@@ -1715,45 +1755,29 @@ void avm_aha_task(void *pvParameters)
 
     if(aha_timer == NULL){
         ESP_LOGE(TAG, "[%s]Creating aha_timer failed.", __func__);
-        goto err_out;
+        goto on_exit;
     }
 
     result = xTimerStart(aha_timer, portMAX_DELAY);
     if(result == pdFAIL){
         ESP_LOGE(TAG, "[%s]Starting aha_timer failed.", __func__);
-        goto err_out;
+        goto on_exit;
     }
-
-#if 0
-    result = esp_task_wdt_add(NULL);
-    if(result != 0){
-        ESP_LOGE(TAG, "WDT task add failed.");
-        goto err_out;
-    }
-
-    result = esp_task_wdt_status(NULL);
-    if(result != 0){
-        ESP_LOGE(TAG, "WDT status check failed.");
-        goto err_out;
-    }
-#endif
 
     srand(esp_get_free_heap_size());
+    heat_mode = aha_heat_off;
 
     do{
-        /* Wait for and clear timer bit */
+        /* Wait for and clear timer bit. */
         events = xEventGroupWaitBits(aha_event_group, BIT_TIMER,
                                      true, false, portMAX_DELAY);
 
-        if(events & BIT_SUSPEND){
-            ESP_LOGD(TAG, "Task suspended");
-            continue;
-        }
-
         if(events & BIT_RELOAD){
-            /* Clear the reload bit before trying to load the config.
+            /*
+             * Clear the reload bit before trying to load the config.
              * This way we will not miss a reload if an update happens
-             * immediately after aha_get_cfg() releases the config mutex */
+             * immediately after aha_get_cfg() releases the config mutex.
+             */
             xEventGroupClearBits(aha_event_group, BIT_RELOAD);
 
             result = aha_get_cfg(&aha_cfg, cfg_nvs);
@@ -1771,18 +1795,29 @@ void avm_aha_task(void *pvParameters)
             } else {
                 ESP_LOGW(TAG, "Config reload failed");
 
-                /* Make sure we try again */
+                /* Make sure we try again. */
                 xEventGroupSetBits(aha_event_group, BIT_RELOAD);
                 continue;
             }
         }
 
-        /* Skip data retrieval if we have connectivity or network issues */
+        if(events & BIT_SUSPEND){
+            ESP_LOGD(TAG, "Task suspended");
+            continue;
+        }
+
+        result = esp_task_wdt_reset();
+        if(result != 0){
+            ESP_LOGE(TAG, "WDT reset failed.");
+            goto on_exit;
+        }
+
+        /* Skip data retrieval if we have connectivity or network issues. */
         if(!esp_wmngr_is_connected()){
             continue;
         }
 
-        /* Everything seems to be in order. Try fetching a new data set */
+        /* Everything seems to be in order. Try fetching a new data set. */
         heph_led_set(true);
         
         result = check_auth(&auth_data);
@@ -1807,31 +1842,25 @@ void avm_aha_task(void *pvParameters)
             continue;
         }
 
+        time(&(new_data->timestamp));
+        new_data->msg = strdup("Don't Panic!");
         dump_data(new_data);
 
-        /* We have a new data set. Analyse it and update heater control */
-        heat_mode = need_heat(new_data);
-        switch(heat_mode){
-        case aha_heat_on:
-            fire(1);
-            break;
-        case aha_heat_off:
-            fire(0);
-            break;
-        default:
-            // do nothing
-            break;
-        }
+        /* We have a new data set. Analyse it and update heater control. */
+        heat_mode = need_heat(new_data, heat_mode);
 
         heph_led_set(false);
 
         ESP_LOGD(TAG, "Free heap before data update: 0x%x", esp_get_free_heap_size());
 
-        /* Try to update public aha state data */
+        /* Try to update public aha state data. */
         if(xSemaphoreTake(aha_data_lock, 100 * portTICK_PERIOD_MS) == pdTRUE){
             old_data = curr_aha_data;
             curr_aha_data = new_data;
             if(old_data != NULL){
+                if(heat_mode == aha_heat_keep){
+                    new_data->heat_on = old_data->heat_on;
+                }
                 aha_data_release(old_data);
             }
             xSemaphoreGive(aha_data_lock);
@@ -1840,16 +1869,14 @@ void avm_aha_task(void *pvParameters)
             aha_data_release(new_data);
         }
 
-        ESP_LOGD(TAG, "Free heap after data update: 0x%x", esp_get_free_heap_size());
-
-        result = esp_task_wdt_reset();
-        if(result != 0){
-            ESP_LOGE(TAG, "WDT reset failed.");
-            goto err_out;
+        if(curr_aha_data != NULL && heat_mode != aha_heat_keep){
+            heph_heat_set(curr_aha_data->heat_on);
         }
+
+        ESP_LOGD(TAG, "Free heap after data update: 0x%x", esp_get_free_heap_size());
     }while(1);
 
-err_out:
+on_exit:
     while(1)
         ;
 

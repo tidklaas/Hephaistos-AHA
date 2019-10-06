@@ -38,7 +38,7 @@
 #include <freertos/event_groups.h>
 #include <esp_wifi.h>
 #include <esp_wps.h>
-#include <esp_event_loop.h>
+#include <esp_event.h>
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
@@ -49,14 +49,13 @@
 #include <esp32/rom/rtc.h>
 #include <esp_ota_ops.h>
 #include <esp_image_format.h>
+#include <esp_sntp.h>
 
 #include <lwip/err.h>
 #include <lwip/sockets.h>
 #include <lwip/sys.h>
 #include <lwip/netdb.h>
 #include <lwip/dns.h>
-
-#include <lwip/apps/sntp.h>
 
 #include <wifi_manager.h>
 #include <libesphttpd/cgiwifi.h>
@@ -72,99 +71,95 @@
 #define FW_RESET_TIME           10
 
 static struct heph_cfg heph_cfg;
+static char sntp_srv[64];
+
 static SemaphoreHandle_t cfg_lock = NULL;
 
 static EventGroupHandle_t heph_event_group;
 static TimerHandle_t heph_timer = NULL;
 static TimerHandle_t fwrst_timer = NULL;
 
-#define HEPH_MAGIC  0x48455048  // "HEPH"
+#define HEPH_MAGIC  0x48455048  /* "HEPH" */
 
 __NOINIT_ATTR static volatile struct _restart_marker {
     uint32_t magic;
     uint32_t count;
 } restart_marker;
 
-static const char *TAG = "hephaistos";
+static const char *TAG = "HEPH";
 
 static const int BIT_TRIGGER       = BIT0;
-static const int BIT_STA_CONNECTED = BIT1;
-static const int BIT_RELOAD_CFG    = BIT2;
-static const int BIT_NTP_SYNC      = BIT3;
-static const int BIT_AHA_CFG       = BIT4;
-static const int BIT_AHA_RUN       = BIT5;
-static const int BIT_FW_RESET      = BIT6;
+static const int BIT_RELOAD_CFG    = BIT1;
+static const int BIT_NTP_SYNC      = BIT2;
+static const int BIT_AHA_CFG       = BIT3;
+static const int BIT_AHA_RUN       = BIT4;
+static const int BIT_FW_RESET      = BIT5;
 
-static esp_err_t event_handler(void *ctx, system_event_t *event)
+static void update_sntp_cb(struct timeval *tv)
 {
-    EventBits_t old, new;
+    char buff[64];
+    struct tm tm;
 
-    old = xEventGroupGetBits(heph_event_group);
+    memset(&tm, 0x0, sizeof(tm));
+    localtime_r(&(tv->tv_sec), &tm);
 
-    switch(event->event_id){
-    case SYSTEM_EVENT_STA_GOT_IP:
-        xEventGroupSetBits(heph_event_group, BIT_STA_CONNECTED);
-        break;
-    case SYSTEM_EVENT_STA_LOST_IP:
-        xEventGroupClearBits(heph_event_group, BIT_STA_CONNECTED);
-        break;
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-        xEventGroupClearBits(heph_event_group, BIT_STA_CONNECTED);
-        break;
-    default:
-        break;
+    if(tm.tm_year > (2016 - 1900)){
+        ESP_LOGI(TAG, "[%s] Got NTP time sync: %s",
+                __func__, asctime_r(&tm, buff));
+
+        xEventGroupSetBits(heph_event_group, BIT_NTP_SYNC);
     }
-
-    new = xEventGroupGetBits(heph_event_group);
-
-    if(old != new){
-        /* Wake up main task */
-        xEventGroupSetBits(heph_event_group, BIT_TRIGGER);
-    }
-
-    return ESP_OK;
 }
 
 static void update_sntp(void)
 {
-    time_t now;
-    struct tm tm;
-    EventBits_t events;
-    bool connected, running;
-    char buff[32];
+    bool connected, running, cfg_changed;
+    struct aha_cfg aha_cfg;
+    esp_err_t result;
 
-    running = sntp_enabled();
+    cfg_changed = false;
+    result = aha_get_cfg(&aha_cfg, cfg_ram);
+    if(result == ESP_ERR_TIMEOUT){
+        /* Temporary error, return immediately. */
+        goto on_exit;
+    }
+
+    if(result != ESP_OK
+       || strncmp(sntp_srv, aha_cfg.fbox_addr, sizeof(aha_cfg.fbox_addr)))
+    {
+        cfg_changed = true;
+    }
 
     connected = esp_wmngr_is_connected();
-    if(!connected){
-        if(running){
+    running = sntp_enabled();
+
+    if(running){
+        if(!connected || cfg_changed){
             ESP_LOGI(TAG, "Stopping SNTP");
             sntp_stop();
-        }
-        xEventGroupClearBits(heph_event_group, BIT_NTP_SYNC);
-    } else {
-        if(!running){
-            ESP_LOGI(TAG, "Starting SNTP");
-            sntp_setoperatingmode(SNTP_OPMODE_POLL);
-            sntp_setservername(0, "pool.ntp.org");
-            sntp_init();
-        }
-
-
-        events = xEventGroupGetBits(heph_event_group);
-        if(!(events & BIT_NTP_SYNC)){
-            time(&now);
-            memset(&tm, 0x0, sizeof(tm));
-            localtime_r(&now, &tm);
-
-            if(tm.tm_year > (2016 - 1900)){
-                ESP_LOGI(TAG, "[%s] Got NTP time sync: %s",
-                        __func__, asctime_r(&tm, buff));
-
-                xEventGroupSetBits(heph_event_group, BIT_NTP_SYNC);
-            }
+            memset(sntp_srv, 0x0, sizeof(sntp_srv));
+            xEventGroupClearBits(heph_event_group, BIT_NTP_SYNC);
+            running = false;
         }
     }
+
+    if(connected && !running){
+        if(strnlen(aha_cfg.fbox_addr, sizeof(aha_cfg.fbox_addr)) == 0){
+            ESP_LOGD(TAG, "[%s] fbox_addr empty", __func__);
+            goto on_exit;
+        }
+
+        ESP_LOGI(TAG, "Starting SNTP");
+        ESP_LOGI(TAG, "SNTP-Server: %s", aha_cfg.fbox_addr);
+        strlcpy(sntp_srv, aha_cfg.fbox_addr, sizeof(sntp_srv));
+        sntp_set_time_sync_notification_cb(update_sntp_cb);
+        sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        sntp_setservername(0, sntp_srv);
+        sntp_init();
+    }
+
+on_exit:
+    return;
 }
 
 esp_err_t heph_set_cfg(struct heph_cfg *cfg, bool reload)
@@ -286,6 +281,7 @@ static esp_err_t reload_cfg(void)
     xSemaphoreGive(cfg_lock);
 
     if(strlen(heph_cfg.tz) > 0){
+        ESP_LOGI(TAG, "[%s] Setting TZ to %s", __func__, heph_cfg.tz);
         setenv("TZ", heph_cfg.tz, 1);
         tzset();
     }
@@ -296,6 +292,7 @@ on_exit:
 
 static void timer_cb(TimerHandle_t timer)
 {
+
     if(timer == fwrst_timer){
         xEventGroupSetBits(heph_event_group, BIT_FW_RESET);
     }
@@ -305,17 +302,18 @@ static void timer_cb(TimerHandle_t timer)
 
 static esp_err_t check_aha_cfg(void)
 {
-    struct aha_cfg aha_cfg;
+    struct aha_cfg cfg;
     esp_err_t result;
 
     ESP_LOGI(TAG, "Fetching AHA config.");
-    result = aha_get_cfg(&aha_cfg, cfg_nvs);
+
+    result = aha_get_cfg(&cfg, cfg_nvs);
     if(result == ESP_OK){
         xEventGroupSetBits(heph_event_group, BIT_AHA_CFG);
-        goto on_exit;
+    } else {
+        xEventGroupClearBits(heph_event_group, BIT_AHA_CFG);
     }
 
-on_exit:
     return result;
 }
 
@@ -423,9 +421,11 @@ static bool check_fwreset(void)
     timer_running = xTimerIsTimerActive(fwrst_timer);
 
     if(gpio_get_level(GPIO_FW_RESET) == 0){
-        /* Button is (still) pressed. If reset timer is not already running,
+        /*
+         * Button is (still) pressed. If reset timer is not already running,
          * start it and initialise the reset counter. Also configure the LED
-         * GPIO to blink rapidly. */
+         * GPIO to blink rapidly.
+         */
         if(timer_running == pdFALSE){
             ESP_LOGI(TAG, "[%s] Starting FW reset timer", __func__);
             (void) xTimerReset(fwrst_timer, portMAX_DELAY);
@@ -448,17 +448,21 @@ static bool check_fwreset(void)
             ledc_channel_config(&ledc_channel);
         }
 
-        /* Increase the counter if the fw_reset_timer has expired since
-         * the last call to this function */
+        /*
+         * Increase the counter if the fw_reset_timer has expired since
+         * the last call to this function.
+         */
         if((events & BIT_FW_RESET) == BIT_FW_RESET){
             ++reset_cnt;
         }
 
         ESP_LOGI(TAG, "[%s] Reset timer count: %d", __func__, reset_cnt);
 
-        /* Button has been pressed for at least FW_RESET_TIME seconds.
+        /*
+         * Button has been pressed for at least FW_RESET_TIME seconds.
          * Change LED duty cycle to constant on and set return value
-         * to true. */
+         * to true.
+         */
         if(reset_cnt >= FW_RESET_TIME){
             chan = ledc_channel.channel;
             mode = ledc_channel.speed_mode;
@@ -469,8 +473,10 @@ static bool check_fwreset(void)
             do_reset = true;
         }
     } else {
-        /* Button is not pressed. If reset timer is running, stop it and
-         * restore LED config to normal function. */
+        /*
+         * Button is not pressed. If reset timer is running, stop it and
+         * restore LED config to normal function.
+         */
         if(timer_running != pdFALSE){
             (void) xTimerStop(fwrst_timer, portMAX_DELAY);
             ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, 0);
@@ -492,8 +498,10 @@ void app_main(void)
 
     fw_reset = false;
 
-    /* Check firmware startup failsafe. Clear NVS if firmware is boot
-     * looping and fall back to previous image. */
+    /*
+     * Check firmware startup failsafe. Clear NVS if firmware is boot
+     * looping and fall back to previous image.
+     */
     if(restart_marker.magic != HEPH_MAGIC){
         ESP_LOGE(TAG, "[%s] Initialising restart marker", __func__);
         restart_marker.magic = HEPH_MAGIC;
@@ -506,10 +514,11 @@ void app_main(void)
             ESP_LOGE(TAG, "Firmware is boot looping, initialising"
                           "fall-back to previous image.");
 
-            /* Invalidate the running image by zeroing out the image's
+            /*
+             * Invalidate the running image by zeroing out the image's
              * header in the SPI flash. Bootloader should fall back to
-             * the last valid image before the OTA. */
-
+             * the last valid image before the OTA.
+             */
             curr_part = esp_ota_get_running_partition();
 
             /* Make sure not to kill the factory image! */
@@ -547,6 +556,7 @@ void app_main(void)
     }
 
     /* Set time zone to compiled-in default. */
+    ESP_LOGI(TAG, "[%s] Settin TZ to %s", __func__, TIMEZONE);
     setenv("TZ", TIMEZONE, 1);
     tzset();
 
@@ -562,8 +572,10 @@ void app_main(void)
         goto on_exit;
     }
 
-    /* Try reading configuration from NVS and set compiled in defaults if it *\
-    \* does not exists.                                                      */
+    /*
+     * Try reading configuration from NVS and set compiled in defaults if it
+     * does not exists.
+     */
     result = heph_get_cfg(&heph_cfg, cfg_nvs);
     if(result != ESP_OK){
         ESP_LOGI(TAG, "No config in NVS, entering setup mode");
@@ -573,9 +585,9 @@ void app_main(void)
         (void) heph_set_cfg(&heph_cfg, true);
     }
 
-    result = esp_event_loop_init(event_handler, NULL);
+    result = esp_event_loop_create_default();
     if(result != ESP_OK){
-        ESP_LOGE(TAG, "[%s] esp_event_loop_init() failed", __func__);
+        ESP_LOGE(TAG, "[%s] esp_event_create_default() failed", __func__);
         goto on_exit;
     }
 
@@ -609,6 +621,12 @@ void app_main(void)
         goto on_exit;
     }
 
+    result = esp_wmngr_start();
+    if(result != ESP_OK){
+        ESP_LOGE(TAG, "esp_wmngr_start() failed.");
+        goto on_exit;
+    }
+
     http_srv_init();
 
     xEventGroupSetBits(heph_event_group, (BIT_TRIGGER | BIT_RELOAD_CFG));
@@ -632,8 +650,8 @@ void app_main(void)
 #if defined(AUTO_WPS)
 #warning AUTO_WPS enabled
         /*
-         * Trigger WPS if no valid WiFi config is found. Only usefull for
-         * development purposes.
+         * Trigger WPS if no valid WiFi config is found. Should only be used
+         * for development purposes.
          */
         if(!esp_wmngr_nvs_valid()
             && (esp_wmngr_get_state() == wmngr_state_idle))
@@ -666,9 +684,11 @@ void app_main(void)
             }
         }
 
-        /* If we get here, the firmware seems to be somewhat stable. Clear
+        /*
+         * If we get here, the firmware seems to be somewhat stable. Clear
          * the incomplete start marker so we will not fall back to previous
-         * image. */
+         * image.
+         */
         restart_marker.count = 0;
     }
 

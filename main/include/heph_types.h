@@ -1,6 +1,6 @@
 /*
  * This file is part of the Hephaistos-AHA project.
- * Copyright (C) 2018  Tido Klaassen <tido_hephaistos@4gh.eu>
+ * Copyright (C) 2018-2019 Tido Klaassen <tido_hephaistos@4gh.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -57,5 +57,5 @@ enum cfg_load_type {
     cfg_ram,
 };
 
-#endif // _HEPH_TYPES_H_
+#endif /* _HEPH_TYPES_H_ */
 

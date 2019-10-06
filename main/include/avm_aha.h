@@ -1,6 +1,6 @@
 /*
  * This file is part of the Hephaistos-AHA project.
- * Copyright (C) 2018  Tido Klaassen <tido_hephaistos@4gh.eu>
+ * Copyright (C) 2018-2019 Tido Klaassen <tido_hephaistos@4gh.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -9,12 +9,13 @@
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the                                
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.              
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA  02110-1301, USA.
  */
 
 #ifndef _AVM_AHA_
@@ -31,6 +32,7 @@ struct aha_data
     struct kref ref_cnt;
     time_t timestamp;
     int status;
+    bool heat_on;
     const char *msg;
     struct klist_head dev_head; // list of all devices
     struct klist_head grp_head; // list of all groups
@@ -179,5 +181,5 @@ extern esp_err_t aha_set_cfg(struct aha_cfg *cfg, bool reload);
 extern void aha_task_suspend(void);
 extern void aha_task_resume(void);
 
-#endif // _AVM_AHA_
+#endif /* _AVM_AHA_ */
 
