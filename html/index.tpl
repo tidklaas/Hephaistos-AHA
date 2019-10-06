@@ -6,7 +6,7 @@
 <div id="main">
 <h1>Welcome to Hephaistos-AHA!</h1>
 <p>
-You can find this <a href="https://github.com/tidklaas/hephaistos">project here on github</a>.<br/>
+You can find this <a href="https://github.com/tidklaas/Hephaistos-AHA">project here on github</a>.<br/>
 <h2>Functionality in this device:</h2>
 <ul>
 <li><a href="user/user.tpl">Configure device user and password</a></li>
